@@ -1,414 +1,603 @@
-"""
-file_filters.py
-
-Deterministic file filtering rules for the SAP Health Check GCS ingestion flow.
-
-This module decides which files should be included or ignored before log/config
-content is read from GCS.
-
-Rules covered:
-1. General allowed file extensions:
-   .log, .txt, .ini, .conf, .master, .smb, .misc, .net
-
-2. Global ignore rules:
-   - Ignore .err files from all folders.
-   - Ignore .lst files from all folders.
-   - Ignore files ending with _bak, .bak, _lst, .lst.
-
-3. Special profile folder rules:
-   - Include default.pfl.
-   - Include files that do not end with numeric suffixes like .1, .2, .3.
-   - Ignore trans.log.
-   - Ignore all .log files inside profile folder.
-   - Ignore .lst files.
-   - Ignore files ending with _bak, .bak, _lst, .lst.
-   - Ignore files ending with numeric suffixes like .1, .2, .3.
-
-The filtering is case-insensitive.
-"""
-
 from __future__ import annotations
 
+import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from pathlib import PurePosixPath
-from typing import Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from .gcs_ingestion import FolderBundle
+from .schemas import CitationType, RetrievalContext, RetrievalHit
+from .tools import query_rag_corpus
 
 
-GENERAL_ALLOWED_EXTENSIONS = {
-    ".log",
-    ".txt",
-    ".ini",
-    ".conf",
-    ".master",
-    ".smb",
-    ".misc",
-    ".net",
-}
+SAP_NOTES_KEYWORDS = (
+    "sap hana",
+    "hana",
+    "saptune",
+    "sap note",
+    "kernel",
+    "parameter",
+    "memory",
+    "cpu",
+    "io",
+    "savepoint",
+    "log",
+    "persistence",
+    "profile",
+    "global.ini",
+    "indexserver.ini",
+    "nameserver.ini",
+    "daemon.ini",
+    "preprocessor.ini",
+)
 
-GLOBAL_IGNORED_EXTENSIONS = {
-    ".err",
-    ".lst",
-}
+GCP_RULE_KEYWORDS = (
+    "gcp",
+    "google cloud",
+    "compute engine",
+    "hana certified",
+    "machine type",
+    "disk",
+    "pd-ssd",
+    "hyperdisk",
+    "network",
+    "os",
+    "suse",
+    "rhel",
+    "filesystem",
+    "backup",
+    "nfs",
+    "firewall",
+    "ntp",
+    "time",
+    "saptune",
+)
 
-PROFILE_REQUIRED_EXACT_FILES = {
-    "default.pfl",
-}
-
-PROFILE_IGNORED_EXACT_FILES = {
-    "trans.log",
-}
-
-
-@dataclass(frozen=True)
-class FileFilterDecision:
-    """
-    Result of applying file filtering rules.
-
-    Attributes:
-        include:
-            True if file should be processed, False if it should be ignored.
-
-        reason:
-            Human-readable reason explaining why the file was included or ignored.
-
-        rule_group:
-            Which rule group was applied: "general" or "profile".
-    """
-
-    include: bool
-    reason: str
-    rule_group: str
-
-
-def normalize_filename(filename: str) -> str:
-    """Normalize filename for case-insensitive comparison."""
-
-    return filename.strip().lower()
-
-
-def normalize_folder_path(folder_relative_path: Optional[str]) -> str:
-    """
-    Normalize folder path.
-
-    Examples:
-        None -> "."
-        "" -> "."
-        "profile/" -> "profile"
-        "HANA/Profile" -> "hana/profile"
-    """
-
-    if not folder_relative_path:
-        return "."
-
-    normalized = str(PurePosixPath(folder_relative_path.strip("/"))).lower()
-    return normalized if normalized else "."
+PREVIOUS_REPORT_KEYWORDS = (
+    "recommendation",
+    "assessment",
+    "finding",
+    "health check",
+    "risk",
+    "issue",
+    "observed",
+    "recommended",
+    "compliant",
+)
 
 
-def is_profile_folder(folder_relative_path: Optional[str]) -> bool:
-    """
-    Check whether the file belongs to a folder named profile.
-
-    This returns True for:
-        profile
-        profile/
-        hana/profile
-        hana/profile/
-        vm-01/hana/profile
-    """
-
-    normalized_path = normalize_folder_path(folder_relative_path)
-    path_parts = PurePosixPath(normalized_path).parts
-
-    return any(part == "profile" for part in path_parts)
+@dataclass
+class RetrievalServiceConfig:
+    sap_rule_book_corpus_id: Optional[str] = None
+    sap_previous_reports_corpus_id: Optional[str] = None
+    sap_notes_corpus_id: Optional[str] = None
+    top_k: int = 8
+    vector_distance_threshold: Optional[float] = None
+    max_queries_per_corpus: int = 8
+    max_query_chars: int = 600
+    max_workers: int = 6
+    include_previous_reports: bool = True
+    include_google_search_placeholder: bool = False
 
 
-def get_file_extension(filename: str) -> str:
-    """
-    Return the final file extension.
-
-    Examples:
-        abc.log -> .log
-        DEFAULT.PFL -> .pfl
-        file -> ""
-        abc.conf.bak -> .bak
-    """
-
-    lowered = normalize_filename(filename)
-    return PurePosixPath(lowered).suffix
+@dataclass
+class CorpusQueryTask:
+    corpus_id: str
+    corpus_name: str
+    citation_type: CitationType
+    query: str
 
 
-def ends_with_number_suffix(filename: str) -> bool:
-    """
-    Check whether filename ends with numeric suffix.
-
-    Examples:
-        DEFAULT.PFL.1 -> True
-        abc.2 -> True
-        abc.100 -> True
-        abc.log -> False
-    """
-
-    lowered = normalize_filename(filename)
-    return bool(re.search(r"\.\d+$", lowered))
+class RetrievalServiceError(Exception):
+    pass
 
 
-def has_backup_or_lst_suffix(filename: str) -> bool:
-    """
-    Check whether filename ends with backup/list suffix.
+def parse_optional_int(value: Optional[str], default: int) -> int:
+    if value is None or str(value).strip() == "":
+        return default
 
-    Matches:
-        _bak
-        .bak
-        _lst
-        .lst
-    """
-
-    lowered = normalize_filename(filename)
-
-    return (
-        lowered.endswith("_bak")
-        or lowered.endswith(".bak")
-        or lowered.endswith("_lst")
-        or lowered.endswith(".lst")
-    )
+    try:
+        return int(value)
+    except ValueError:
+        return default
 
 
-def is_global_ignored_file(filename: str) -> Tuple[bool, str]:
-    """
-    Apply global ignore rules.
+def parse_optional_float(value: Optional[str]) -> Optional[float]:
+    if value is None or str(value).strip() == "":
+        return None
 
-    These rules apply to all folders, including profile.
-    """
-
-    lowered = normalize_filename(filename)
-    extension = get_file_extension(lowered)
-
-    if extension == ".err":
-        return True, "Ignored because .err files are excluded globally."
-
-    if extension == ".lst":
-        return True, "Ignored because .lst files are excluded globally."
-
-    if has_backup_or_lst_suffix(lowered):
-        return True, "Ignored because backup/list suffix files are excluded globally."
-
-    return False, ""
+    try:
+        return float(value)
+    except ValueError:
+        return None
 
 
-def should_include_general_file(filename: str) -> FileFilterDecision:
-    """
-    Apply general file filtering rules.
-
-    General allowed extensions:
-        .log, .txt, .ini, .conf, .master, .smb, .misc, .net
-
-    General ignored files:
-        .err, .lst, *_bak, *.bak, *_lst
-    """
-
-    lowered = normalize_filename(filename)
-    extension = get_file_extension(lowered)
-
-    ignored, reason = is_global_ignored_file(lowered)
-    if ignored:
-        return FileFilterDecision(
-            include=False,
-            reason=reason,
-            rule_group="general",
-        )
-
-    if extension in GENERAL_ALLOWED_EXTENSIONS:
-        return FileFilterDecision(
-            include=True,
-            reason=f"Included because extension {extension} is allowed.",
-            rule_group="general",
-        )
-
-    return FileFilterDecision(
-        include=False,
-        reason=(
-            f"Ignored because extension {extension or '[no extension]'} "
-            "is not in the general allowed extension list."
+def get_default_config() -> RetrievalServiceConfig:
+    return RetrievalServiceConfig(
+        sap_rule_book_corpus_id=os.environ.get("CORPUS_ID_SAP_RULE_BOOK"),
+        sap_previous_reports_corpus_id=os.environ.get("CORPUS_ID_SAP_PREVIOUS_REPS"),
+        sap_notes_corpus_id=os.environ.get("CORPUS_ID_SAP_NOTES_CHECK"),
+        top_k=parse_optional_int(os.environ.get("RAG_DEFAULT_TOP_K"), 8),
+        vector_distance_threshold=parse_optional_float(
+            os.environ.get("RAG_DEFAULT_VECTOR_DISTANCE_THRESHOLD")
         ),
-        rule_group="general",
-    )
-
-
-def should_include_profile_file(filename: str) -> FileFilterDecision:
-    """
-    Apply special profile folder rules.
-
-    Inside profile folder:
-    - Include default.pfl.
-    - Include files that do not match exclusion rules.
-    - Ignore trans.log.
-    - Ignore all .log files.
-    - Ignore .lst files.
-    - Ignore backup/list suffix files.
-    - Ignore numeric suffix files like .1, .2, .3.
-    """
-
-    lowered = normalize_filename(filename)
-    extension = get_file_extension(lowered)
-
-    ignored, reason = is_global_ignored_file(lowered)
-    if ignored:
-        return FileFilterDecision(
-            include=False,
-            reason=reason,
-            rule_group="profile",
-        )
-
-    if lowered in PROFILE_IGNORED_EXACT_FILES:
-        return FileFilterDecision(
-            include=False,
-            reason="Ignored because trans.log is excluded inside profile folder.",
-            rule_group="profile",
-        )
-
-    if extension == ".log":
-        return FileFilterDecision(
-            include=False,
-            reason="Ignored because .log files are excluded inside profile folder.",
-            rule_group="profile",
-        )
-
-    if ends_with_number_suffix(lowered):
-        return FileFilterDecision(
-            include=False,
-            reason=(
-                "Ignored because numeric suffix files like .1, .2, .3 "
-                "are excluded inside profile folder."
-            ),
-            rule_group="profile",
-        )
-
-    if lowered in PROFILE_REQUIRED_EXACT_FILES:
-        return FileFilterDecision(
-            include=True,
-            reason="Included because default.pfl is explicitly required inside profile folder.",
-            rule_group="profile",
-        )
-
-    return FileFilterDecision(
-        include=True,
-        reason=(
-            "Included because file is inside profile folder and does not match "
-            "any profile exclusion rule."
+        max_queries_per_corpus=parse_optional_int(
+            os.environ.get("SAP_HC_MAX_RETRIEVAL_QUERIES_PER_CORPUS"), 8
         ),
-        rule_group="profile",
+        max_query_chars=parse_optional_int(
+            os.environ.get("SAP_HC_MAX_RETRIEVAL_QUERY_CHARS"), 600
+        ),
+        max_workers=parse_optional_int(
+            os.environ.get("SAP_HC_RETRIEVAL_MAX_WORKERS"), 6
+        ),
+        include_previous_reports=os.environ.get(
+            "SAP_HC_INCLUDE_PREVIOUS_REPORTS", "true"
+        ).lower()
+        in {"1", "true", "yes", "y"},
     )
 
 
-def should_include_file_detailed(
-    filename: str,
-    folder_relative_path: Optional[str],
-) -> FileFilterDecision:
-    """
-    Decide whether a file should be included.
+def normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
 
-    Profile folder rules override general rules.
 
-    Args:
-        filename:
-            File basename only, for example:
-            "global.ini", "DEFAULT.PFL", "trans.log"
+def truncate_query(query: str, max_query_chars: int) -> str:
+    query = normalize_text(query)
+    if len(query) <= max_query_chars:
+        return query
+    return query[:max_query_chars].rsplit(" ", 1)[0].strip()
 
-        folder_relative_path:
-            Folder path relative to the VM folder, for example:
-            "os", "hana/profile", "profile"
 
-    Returns:
-        FileFilterDecision
-    """
+def dedupe_keep_order(items: Iterable[str]) -> List[str]:
+    seen = set()
+    output = []
 
-    if not filename or not filename.strip():
-        return FileFilterDecision(
-            include=False,
-            reason="Ignored because filename is empty.",
-            rule_group="general",
+    for item in items:
+        normalized = normalize_text(item)
+        lowered = normalized.lower()
+
+        if not normalized or lowered in seen:
+            continue
+
+        seen.add(lowered)
+        output.append(normalized)
+
+    return output
+
+
+def extract_candidate_lines(text: str, max_lines: int = 120) -> List[str]:
+    output = []
+
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+
+        if not line:
+            continue
+
+        lowered = line.lower()
+
+        if line.startswith("====="):
+            continue
+
+        if len(line) > 500:
+            line = line[:500]
+
+        if any(keyword in lowered for keyword in SAP_NOTES_KEYWORDS):
+            output.append(line)
+            continue
+
+        if any(keyword in lowered for keyword in GCP_RULE_KEYWORDS):
+            output.append(line)
+            continue
+
+        if re.search(r"\b(error|warning|failed|disabled|enabled|critical|recommend)\b", lowered):
+            output.append(line)
+            continue
+
+        if re.search(r"\b\d+(\.\d+)?\s*(gb|mb|kb|tb|ms|sec|seconds|minutes|%)\b", lowered):
+            output.append(line)
+            continue
+
+        if re.search(r"\b[a-zA-Z0-9_.-]+\s*[:=]\s*[^=\s].+", line):
+            output.append(line)
+            continue
+
+        if len(output) >= max_lines:
+            break
+
+    return dedupe_keep_order(output)[:max_lines]
+
+
+def extract_parameter_pairs(text: str, max_pairs: int = 80) -> List[str]:
+    pairs = []
+
+    patterns = [
+        r"^\s*([A-Za-z0-9_.\-/]+)\s*=\s*(.+?)\s*$",
+        r"^\s*([A-Za-z0-9_.\-/]+)\s*:\s*(.+?)\s*$",
+        r"^\s*([A-Za-z0-9_.\-/]+)\s+(.+?)\s*$",
+    ]
+
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+
+        if not line or line.startswith("====="):
+            continue
+
+        for pattern in patterns:
+            match = re.match(pattern, line)
+            if not match:
+                continue
+
+            key = match.group(1).strip()
+            value = match.group(2).strip()
+
+            if not key or not value:
+                continue
+
+            if len(key) > 120 or len(value) > 250:
+                continue
+
+            if key.lower() in {"relative", "folder", "lines", "truncated"}:
+                continue
+
+            pairs.append(f"{key} = {value}")
+            break
+
+        if len(pairs) >= max_pairs:
+            break
+
+    return dedupe_keep_order(pairs)[:max_pairs]
+
+
+def extract_file_names(bundle: FolderBundle, max_items: int = 20) -> List[str]:
+    names = []
+
+    for included_file in bundle.included_files:
+        names.append(included_file.filename)
+        names.append(included_file.relative_path)
+
+    return dedupe_keep_order(names)[:max_items]
+
+
+def detect_folder_theme(bundle: FolderBundle) -> str:
+    folder = bundle.folder_relative_path.lower()
+    text_sample = bundle.combined_text[:10000].lower()
+
+    if "profile" in folder:
+        return "SAP HANA profile parameters DEFAULT.PFL instance profiles"
+    if "network" in folder or any(term in text_sample for term in ("ifconfig", "ip route", "netstat", "firewall")):
+        return "network configuration firewall routes DNS ports SAP HANA"
+    if "hana" in folder or any(term in text_sample for term in ("global.ini", "indexserver", "nameserver", "hdb")):
+        return "SAP HANA database configuration parameters"
+    if "os" in folder or any(term in text_sample for term in ("saptune", "sysctl", "limits.conf", "transparent huge")):
+        return "operating system tuning SAP HANA Linux saptune"
+    if "disk" in folder or "filesystem" in folder or any(term in text_sample for term in ("df -h", "lsblk", "/hana/data", "/hana/log")):
+        return "filesystem storage disk layout SAP HANA persistence"
+    return "SAP HANA health check configuration"
+
+
+def build_base_queries(bundle: FolderBundle, config: RetrievalServiceConfig) -> List[str]:
+    theme = detect_folder_theme(bundle)
+    candidate_lines = extract_candidate_lines(bundle.combined_text)
+    parameter_pairs = extract_parameter_pairs(bundle.combined_text)
+    file_names = extract_file_names(bundle)
+
+    queries = [
+        f"{theme} recommendation best practice",
+        f"{bundle.vm_name} {bundle.folder_relative_path} {theme}",
+    ]
+
+    for pair in parameter_pairs[:12]:
+        queries.append(f"{theme} {pair}")
+
+    for line in candidate_lines[:12]:
+        queries.append(f"{theme} {line}")
+
+    for file_name in file_names[:8]:
+        queries.append(f"{theme} {file_name}")
+
+    return [
+        truncate_query(query, config.max_query_chars)
+        for query in dedupe_keep_order(queries)
+        if query
+    ][: config.max_queries_per_corpus]
+
+
+def build_sap_notes_queries(
+    bundle: FolderBundle,
+    config: RetrievalServiceConfig,
+) -> List[str]:
+    theme = detect_folder_theme(bundle)
+    base_queries = build_base_queries(bundle, config)
+
+    queries = [
+        f"SAP Note SAP HANA {theme}",
+        f"SAP HANA official SAP Notes {bundle.folder_relative_path}",
+    ]
+
+    for query in base_queries:
+        queries.append(f"SAP Note {query}")
+
+    return [
+        truncate_query(query, config.max_query_chars)
+        for query in dedupe_keep_order(queries)
+    ][: config.max_queries_per_corpus]
+
+
+def build_gcp_rule_book_queries(
+    bundle: FolderBundle,
+    config: RetrievalServiceConfig,
+) -> List[str]:
+    theme = detect_folder_theme(bundle)
+    base_queries = build_base_queries(bundle, config)
+
+    queries = [
+        f"Google Cloud SAP HANA GCP rule book {theme}",
+        f"GCP best practices for SAP HANA {bundle.folder_relative_path}",
+    ]
+
+    for query in base_queries:
+        queries.append(f"GCP SAP HANA rule check {query}")
+
+    return [
+        truncate_query(query, config.max_query_chars)
+        for query in dedupe_keep_order(queries)
+    ][: config.max_queries_per_corpus]
+
+
+def build_previous_report_queries(
+    bundle: FolderBundle,
+    config: RetrievalServiceConfig,
+) -> List[str]:
+    theme = detect_folder_theme(bundle)
+    base_queries = build_base_queries(bundle, config)
+
+    queries = [
+        f"Previous SAP HANA assessment report {theme}",
+        f"Historical recommendation SAP HANA {bundle.folder_relative_path}",
+    ]
+
+    for query in base_queries:
+        queries.append(f"Previous assessment recommendation {query}")
+
+    return [
+        truncate_query(query, config.max_query_chars)
+        for query in dedupe_keep_order(queries)
+    ][: config.max_queries_per_corpus]
+
+
+def build_corpus_tasks(
+    bundle: FolderBundle,
+    config: RetrievalServiceConfig,
+) -> List[CorpusQueryTask]:
+    tasks = []
+
+    if config.sap_notes_corpus_id:
+        for query in build_sap_notes_queries(bundle, config):
+            tasks.append(
+                CorpusQueryTask(
+                    corpus_id=config.sap_notes_corpus_id,
+                    corpus_name="sap_notes",
+                    citation_type=CitationType.SAP_NOTE,
+                    query=query,
+                )
+            )
+
+    if config.sap_rule_book_corpus_id:
+        for query in build_gcp_rule_book_queries(bundle, config):
+            tasks.append(
+                CorpusQueryTask(
+                    corpus_id=config.sap_rule_book_corpus_id,
+                    corpus_name="gcp_rule_book",
+                    citation_type=CitationType.GCP_RULE_BOOK,
+                    query=query,
+                )
+            )
+
+    if config.include_previous_reports and config.sap_previous_reports_corpus_id:
+        for query in build_previous_report_queries(bundle, config):
+            tasks.append(
+                CorpusQueryTask(
+                    corpus_id=config.sap_previous_reports_corpus_id,
+                    corpus_name="previous_reports",
+                    citation_type=CitationType.PREVIOUS_ASSESSMENT_REPORT,
+                    query=query,
+                )
+            )
+
+    return tasks
+
+
+def run_single_corpus_query(
+    task: CorpusQueryTask,
+    config: RetrievalServiceConfig,
+) -> List[RetrievalHit]:
+    response = query_rag_corpus(
+        corpus_id=task.corpus_id,
+        query_text=task.query,
+        top_k=config.top_k,
+        vector_distance_threshold=config.vector_distance_threshold,
+    )
+
+    if not isinstance(response, dict):
+        return []
+
+    if response.get("status") != "success":
+        return []
+
+    hits = []
+
+    for item in response.get("results", []) or []:
+        text = normalize_text(str(item.get("text") or ""))
+
+        if not text:
+            continue
+
+        relevance_score = item.get("relevance_score")
+
+        try:
+            relevance_score = float(relevance_score) if relevance_score is not None else None
+        except (TypeError, ValueError):
+            relevance_score = None
+
+        hits.append(
+            RetrievalHit(
+                citation_type=task.citation_type,
+                corpus_id=task.corpus_id,
+                corpus_name=task.corpus_name,
+                query=task.query,
+                text=text,
+                source_uri=item.get("source_uri"),
+                source_title=item.get("source_title"),
+                relevance_score=relevance_score,
+                metadata={
+                    key: value
+                    for key, value in item.items()
+                    if key
+                    not in {
+                        "text",
+                        "source_uri",
+                        "source_title",
+                        "relevance_score",
+                    }
+                },
+            )
         )
 
-    if is_profile_folder(folder_relative_path):
-        return should_include_profile_file(filename)
-
-    return should_include_general_file(filename)
+    return hits
 
 
-def should_include_file(
-    filename: str,
-    folder_relative_path: Optional[str],
-) -> Tuple[bool, str]:
-    """
-    Backward-compatible helper.
-
-    Returns:
-        (include, reason)
-
-    This is useful for gcs_ingestion.py, where we only need the boolean
-    decision and explanation.
-    """
-
-    decision = should_include_file_detailed(
-        filename=filename,
-        folder_relative_path=folder_relative_path,
-    )
-    return decision.include, decision.reason
-
-
-def should_ignore_file(
-    filename: str,
-    folder_relative_path: Optional[str],
-) -> Tuple[bool, str]:
-    """
-    Convenience helper.
-
-    Returns:
-        (ignore, reason)
-    """
-
-    decision = should_include_file_detailed(
-        filename=filename,
-        folder_relative_path=folder_relative_path,
-    )
-
-    return not decision.include, decision.reason
-
-
-def is_allowed_general_extension(filename: str) -> bool:
-    """Return True if the file extension is generally allowed."""
-
-    return get_file_extension(filename) in GENERAL_ALLOWED_EXTENSIONS
-
-
-def is_globally_ignored_extension(filename: str) -> bool:
-    """Return True if the file extension is globally ignored."""
-
-    return get_file_extension(filename) in GLOBAL_IGNORED_EXTENSIONS
-
-
-def explain_file_filter_decision(
-    filename: str,
-    folder_relative_path: Optional[str],
-) -> str:
-    """
-    Return a human-readable explanation of the filter decision.
-
-    Useful for logs, progress callbacks, debugging, or final ingestion summary.
-    """
-
-    decision = should_include_file_detailed(
-        filename=filename,
-        folder_relative_path=folder_relative_path,
-    )
-
-    action = "INCLUDED" if decision.include else "IGNORED"
-    folder = normalize_folder_path(folder_relative_path)
-
+def hit_dedupe_key(hit: RetrievalHit) -> Tuple[str, str, str]:
     return (
-        f"{action}: {filename} | "
-        f"folder={folder} | "
-        f"rule_group={decision.rule_group} | "
-        f"reason={decision.reason}"
-  )
+        hit.citation_type.value,
+        hit.source_uri or "",
+        normalize_text(hit.text[:300]).lower(),
+    )
+
+
+def dedupe_hits(hits: Sequence[RetrievalHit]) -> List[RetrievalHit]:
+    seen = set()
+    output = []
+
+    for hit in hits:
+        key = hit_dedupe_key(hit)
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        output.append(hit)
+
+    return output
+
+
+def sort_hits(hits: Sequence[RetrievalHit]) -> List[RetrievalHit]:
+    return sorted(
+        hits,
+        key=lambda hit: (
+            hit.relevance_score is None,
+            hit.relevance_score if hit.relevance_score is not None else 999999.0,
+        ),
+    )
+
+
+def group_hits_by_type(hits: Sequence[RetrievalHit]) -> Dict[CitationType, List[RetrievalHit]]:
+    grouped: Dict[CitationType, List[RetrievalHit]] = {}
+
+    for hit in hits:
+        grouped.setdefault(hit.citation_type, []).append(hit)
+
+    return grouped
+
+
+def build_retrieval_context(
+    bundle: FolderBundle,
+    config: Optional[RetrievalServiceConfig] = None,
+) -> RetrievalContext:
+    config = config or get_default_config()
+    tasks = build_corpus_tasks(bundle, config)
+
+    if not tasks:
+        return RetrievalContext()
+
+    all_hits: List[RetrievalHit] = []
+
+    max_workers = max(1, min(config.max_workers, len(tasks)))
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_task = {
+            executor.submit(run_single_corpus_query, task, config): task
+            for task in tasks
+        }
+
+        for future in as_completed(future_to_task):
+            try:
+                all_hits.extend(future.result())
+            except Exception:
+                continue
+
+    all_hits = sort_hits(dedupe_hits(all_hits))
+    grouped = group_hits_by_type(all_hits)
+
+    return RetrievalContext(
+        sap_notes_hits=grouped.get(CitationType.SAP_NOTE, []),
+        gcp_rule_book_hits=grouped.get(CitationType.GCP_RULE_BOOK, []),
+        previous_report_hits=grouped.get(CitationType.PREVIOUS_ASSESSMENT_REPORT, []),
+        google_search_hits=grouped.get(CitationType.GOOGLE_SEARCH, []),
+        other_hits=grouped.get(CitationType.OTHER, []),
+        search_queries_used=dedupe_keep_order(task.query for task in tasks),
+    )
+
+
+class RetrievalService:
+    def __init__(self, config: Optional[RetrievalServiceConfig] = None):
+        self.config = config or get_default_config()
+
+    def build_context(self, bundle: FolderBundle) -> RetrievalContext:
+        return build_retrieval_context(bundle=bundle, config=self.config)
+
+    def __call__(self, bundle: FolderBundle) -> RetrievalContext:
+        return self.build_context(bundle)
+
+
+def create_retrieval_callable(
+    config: Optional[RetrievalServiceConfig] = None,
+) -> RetrievalService:
+    return RetrievalService(config=config)
+
+
+def retrieval_context_to_text(context: RetrievalContext) -> str:
+    sections = []
+
+    def add_section(title: str, hits: List[RetrievalHit]) -> None:
+        if not hits:
+            return
+
+        sections.append(f"\n## {title}\n")
+
+        for index, hit in enumerate(hits, start=1):
+            source = hit.source_uri or hit.source_title or hit.corpus_name or "unknown source"
+            score = (
+                f"{hit.relevance_score:.4f}"
+                if hit.relevance_score is not None
+                else "N/A"
+            )
+            sections.append(
+                "\n".join(
+                    [
+                        f"### {index}. {source}",
+                        f"Query: {hit.query}",
+                        f"Score: {score}",
+                        hit.text,
+                    ]
+                )
+            )
+
+    add_section("SAP Notes Context", context.sap_notes_hits)
+    add_section("GCP Rule Book Context", context.gcp_rule_book_hits)
+    add_section("Previous Assessment Reports Context", context.previous_report_hits)
+    add_section("Google Search Context", context.google_search_hits)
+    add_section("Other Context", context.other_hits)
+
+    return "\n\n".join(sections).strip()
