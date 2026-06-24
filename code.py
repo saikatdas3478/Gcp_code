@@ -1,603 +1,610 @@
 from __future__ import annotations
 
-import os
-import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from datetime import datetime, timezone
+from typing import Callable, Dict, List, Optional
 
-from .gcs_ingestion import FolderBundle
-from .schemas import CitationType, RetrievalContext, RetrievalHit
-from .tools import query_rag_corpus
+from google.cloud import storage
 
-
-SAP_NOTES_KEYWORDS = (
-    "sap hana",
-    "hana",
-    "saptune",
-    "sap note",
-    "kernel",
-    "parameter",
-    "memory",
-    "cpu",
-    "io",
-    "savepoint",
-    "log",
-    "persistence",
-    "profile",
-    "global.ini",
-    "indexserver.ini",
-    "nameserver.ini",
-    "daemon.ini",
-    "preprocessor.ini",
+from .gcs_ingestion import (
+    DEFAULT_MAX_LINES_PER_FILE,
+    FolderBundle,
+    GCSIngestionError,
+    VMIngestionResult,
+    ingest_vm_folder,
+    list_vm_prefixes,
+    parse_gcs_uri,
+)
+from .schemas import (
+    FinalHealthCheckReport,
+    FolderAnalysisInput,
+    FolderRecommendationOutput,
+    PipelineProcessingSummary,
+    ProcessingStatus,
+    ProgressEvent,
+    ProgressEventType,
+    RetrievalContext,
+    SourceFileMetadata,
+    VMConsolidationInput,
+    VMRecommendationOutput,
 )
 
-GCP_RULE_KEYWORDS = (
-    "gcp",
-    "google cloud",
-    "compute engine",
-    "hana certified",
-    "machine type",
-    "disk",
-    "pd-ssd",
-    "hyperdisk",
-    "network",
-    "os",
-    "suse",
-    "rhel",
-    "filesystem",
-    "backup",
-    "nfs",
-    "firewall",
-    "ntp",
-    "time",
-    "saptune",
-)
 
-PREVIOUS_REPORT_KEYWORDS = (
-    "recommendation",
-    "assessment",
-    "finding",
-    "health check",
-    "risk",
-    "issue",
-    "observed",
-    "recommended",
-    "compliant",
-)
+ProgressCallback = Optional[Callable[[ProgressEvent], None]]
+RetrievalCallable = Callable[[FolderBundle], RetrievalContext]
+FolderLLMCallable = Callable[[FolderAnalysisInput], FolderRecommendationOutput]
+VMConsolidationCallable = Callable[[VMConsolidationInput], VMRecommendationOutput]
 
 
 @dataclass
-class RetrievalServiceConfig:
-    sap_rule_book_corpus_id: Optional[str] = None
-    sap_previous_reports_corpus_id: Optional[str] = None
-    sap_notes_corpus_id: Optional[str] = None
-    top_k: int = 8
-    vector_distance_threshold: Optional[float] = None
-    max_queries_per_corpus: int = 8
-    max_query_chars: int = 600
-    max_workers: int = 6
-    include_previous_reports: bool = True
-    include_google_search_placeholder: bool = False
+class FolderProcessingResult:
+    vm_name: str
+    folder_relative_path: str
+    output: FolderRecommendationOutput
 
 
 @dataclass
-class CorpusQueryTask:
-    corpus_id: str
-    corpus_name: str
-    citation_type: CitationType
-    query: str
+class VMProcessingResult:
+    vm_name: str
+    ingestion_result: VMIngestionResult
+    folder_outputs: List[FolderRecommendationOutput]
+    vm_output: VMRecommendationOutput
 
 
-class RetrievalServiceError(Exception):
+@dataclass
+class PipelineResult:
+    report: FinalHealthCheckReport
+    vm_results: List[VMProcessingResult]
+
+
+@dataclass
+class OrchestratorConfig:
+    root_gcs_uri: str
+    output_gcs_uri: Optional[str] = None
+    max_lines_per_file: int = DEFAULT_MAX_LINES_PER_FILE
+    max_vm_workers: int = 3
+    continue_on_folder_error: bool = True
+    continue_on_vm_error: bool = True
+
+
+class FolderOrchestrationError(Exception):
     pass
 
 
-def parse_optional_int(value: Optional[str], default: int) -> int:
-    if value is None or str(value).strip() == "":
-        return default
+def emit_progress(
+    callback: ProgressCallback,
+    event_type: ProgressEventType,
+    status: ProcessingStatus,
+    message: str,
+    vm_name: Optional[str] = None,
+    folder_name: Optional[str] = None,
+    current: Optional[int] = None,
+    total: Optional[int] = None,
+    details: Optional[Dict[str, object]] = None,
+) -> None:
+    if callback is None:
+        return
 
-    try:
-        return int(value)
-    except ValueError:
-        return default
-
-
-def parse_optional_float(value: Optional[str]) -> Optional[float]:
-    if value is None or str(value).strip() == "":
-        return None
-
-    try:
-        return float(value)
-    except ValueError:
-        return None
-
-
-def get_default_config() -> RetrievalServiceConfig:
-    return RetrievalServiceConfig(
-        sap_rule_book_corpus_id=os.environ.get("CORPUS_ID_SAP_RULE_BOOK"),
-        sap_previous_reports_corpus_id=os.environ.get("CORPUS_ID_SAP_PREVIOUS_REPS"),
-        sap_notes_corpus_id=os.environ.get("CORPUS_ID_SAP_NOTES_CHECK"),
-        top_k=parse_optional_int(os.environ.get("RAG_DEFAULT_TOP_K"), 8),
-        vector_distance_threshold=parse_optional_float(
-            os.environ.get("RAG_DEFAULT_VECTOR_DISTANCE_THRESHOLD")
-        ),
-        max_queries_per_corpus=parse_optional_int(
-            os.environ.get("SAP_HC_MAX_RETRIEVAL_QUERIES_PER_CORPUS"), 8
-        ),
-        max_query_chars=parse_optional_int(
-            os.environ.get("SAP_HC_MAX_RETRIEVAL_QUERY_CHARS"), 600
-        ),
-        max_workers=parse_optional_int(
-            os.environ.get("SAP_HC_RETRIEVAL_MAX_WORKERS"), 6
-        ),
-        include_previous_reports=os.environ.get(
-            "SAP_HC_INCLUDE_PREVIOUS_REPORTS", "true"
-        ).lower()
-        in {"1", "true", "yes", "y"},
+    callback(
+        ProgressEvent(
+            event_type=event_type,
+            status=status,
+            message=message,
+            vm_name=vm_name,
+            folder_name=folder_name,
+            current=current,
+            total=total,
+            details=details or {},
+        )
     )
 
 
-def normalize_text(text: str) -> str:
-    return re.sub(r"\s+", " ", text or "").strip()
-
-
-def truncate_query(query: str, max_query_chars: int) -> str:
-    query = normalize_text(query)
-    if len(query) <= max_query_chars:
-        return query
-    return query[:max_query_chars].rsplit(" ", 1)[0].strip()
-
-
-def dedupe_keep_order(items: Iterable[str]) -> List[str]:
-    seen = set()
-    output = []
-
-    for item in items:
-        normalized = normalize_text(item)
-        lowered = normalized.lower()
-
-        if not normalized or lowered in seen:
-            continue
-
-        seen.add(lowered)
-        output.append(normalized)
-
-    return output
-
-
-def extract_candidate_lines(text: str, max_lines: int = 120) -> List[str]:
-    output = []
-
-    for raw_line in (text or "").splitlines():
-        line = raw_line.strip()
-
-        if not line:
-            continue
-
-        lowered = line.lower()
-
-        if line.startswith("====="):
-            continue
-
-        if len(line) > 500:
-            line = line[:500]
-
-        if any(keyword in lowered for keyword in SAP_NOTES_KEYWORDS):
-            output.append(line)
-            continue
-
-        if any(keyword in lowered for keyword in GCP_RULE_KEYWORDS):
-            output.append(line)
-            continue
-
-        if re.search(r"\b(error|warning|failed|disabled|enabled|critical|recommend)\b", lowered):
-            output.append(line)
-            continue
-
-        if re.search(r"\b\d+(\.\d+)?\s*(gb|mb|kb|tb|ms|sec|seconds|minutes|%)\b", lowered):
-            output.append(line)
-            continue
-
-        if re.search(r"\b[a-zA-Z0-9_.-]+\s*[:=]\s*[^=\s].+", line):
-            output.append(line)
-            continue
-
-        if len(output) >= max_lines:
-            break
-
-    return dedupe_keep_order(output)[:max_lines]
-
-
-def extract_parameter_pairs(text: str, max_pairs: int = 80) -> List[str]:
-    pairs = []
-
-    patterns = [
-        r"^\s*([A-Za-z0-9_.\-/]+)\s*=\s*(.+?)\s*$",
-        r"^\s*([A-Za-z0-9_.\-/]+)\s*:\s*(.+?)\s*$",
-        r"^\s*([A-Za-z0-9_.\-/]+)\s+(.+?)\s*$",
-    ]
-
-    for raw_line in (text or "").splitlines():
-        line = raw_line.strip()
-
-        if not line or line.startswith("====="):
-            continue
-
-        for pattern in patterns:
-            match = re.match(pattern, line)
-            if not match:
-                continue
-
-            key = match.group(1).strip()
-            value = match.group(2).strip()
-
-            if not key or not value:
-                continue
-
-            if len(key) > 120 or len(value) > 250:
-                continue
-
-            if key.lower() in {"relative", "folder", "lines", "truncated"}:
-                continue
-
-            pairs.append(f"{key} = {value}")
-            break
-
-        if len(pairs) >= max_pairs:
-            break
-
-    return dedupe_keep_order(pairs)[:max_pairs]
-
-
-def extract_file_names(bundle: FolderBundle, max_items: int = 20) -> List[str]:
-    names = []
-
-    for included_file in bundle.included_files:
-        names.append(included_file.filename)
-        names.append(included_file.relative_path)
-
-    return dedupe_keep_order(names)[:max_items]
-
-
-def detect_folder_theme(bundle: FolderBundle) -> str:
-    folder = bundle.folder_relative_path.lower()
-    text_sample = bundle.combined_text[:10000].lower()
-
-    if "profile" in folder:
-        return "SAP HANA profile parameters DEFAULT.PFL instance profiles"
-    if "network" in folder or any(term in text_sample for term in ("ifconfig", "ip route", "netstat", "firewall")):
-        return "network configuration firewall routes DNS ports SAP HANA"
-    if "hana" in folder or any(term in text_sample for term in ("global.ini", "indexserver", "nameserver", "hdb")):
-        return "SAP HANA database configuration parameters"
-    if "os" in folder or any(term in text_sample for term in ("saptune", "sysctl", "limits.conf", "transparent huge")):
-        return "operating system tuning SAP HANA Linux saptune"
-    if "disk" in folder or "filesystem" in folder or any(term in text_sample for term in ("df -h", "lsblk", "/hana/data", "/hana/log")):
-        return "filesystem storage disk layout SAP HANA persistence"
-    return "SAP HANA health check configuration"
-
-
-def build_base_queries(bundle: FolderBundle, config: RetrievalServiceConfig) -> List[str]:
-    theme = detect_folder_theme(bundle)
-    candidate_lines = extract_candidate_lines(bundle.combined_text)
-    parameter_pairs = extract_parameter_pairs(bundle.combined_text)
-    file_names = extract_file_names(bundle)
-
-    queries = [
-        f"{theme} recommendation best practice",
-        f"{bundle.vm_name} {bundle.folder_relative_path} {theme}",
-    ]
-
-    for pair in parameter_pairs[:12]:
-        queries.append(f"{theme} {pair}")
-
-    for line in candidate_lines[:12]:
-        queries.append(f"{theme} {line}")
-
-    for file_name in file_names[:8]:
-        queries.append(f"{theme} {file_name}")
-
-    return [
-        truncate_query(query, config.max_query_chars)
-        for query in dedupe_keep_order(queries)
-        if query
-    ][: config.max_queries_per_corpus]
-
-
-def build_sap_notes_queries(
-    bundle: FolderBundle,
-    config: RetrievalServiceConfig,
-) -> List[str]:
-    theme = detect_folder_theme(bundle)
-    base_queries = build_base_queries(bundle, config)
-
-    queries = [
-        f"SAP Note SAP HANA {theme}",
-        f"SAP HANA official SAP Notes {bundle.folder_relative_path}",
-    ]
-
-    for query in base_queries:
-        queries.append(f"SAP Note {query}")
-
-    return [
-        truncate_query(query, config.max_query_chars)
-        for query in dedupe_keep_order(queries)
-    ][: config.max_queries_per_corpus]
-
-
-def build_gcp_rule_book_queries(
-    bundle: FolderBundle,
-    config: RetrievalServiceConfig,
-) -> List[str]:
-    theme = detect_folder_theme(bundle)
-    base_queries = build_base_queries(bundle, config)
-
-    queries = [
-        f"Google Cloud SAP HANA GCP rule book {theme}",
-        f"GCP best practices for SAP HANA {bundle.folder_relative_path}",
-    ]
-
-    for query in base_queries:
-        queries.append(f"GCP SAP HANA rule check {query}")
-
-    return [
-        truncate_query(query, config.max_query_chars)
-        for query in dedupe_keep_order(queries)
-    ][: config.max_queries_per_corpus]
-
-
-def build_previous_report_queries(
-    bundle: FolderBundle,
-    config: RetrievalServiceConfig,
-) -> List[str]:
-    theme = detect_folder_theme(bundle)
-    base_queries = build_base_queries(bundle, config)
-
-    queries = [
-        f"Previous SAP HANA assessment report {theme}",
-        f"Historical recommendation SAP HANA {bundle.folder_relative_path}",
-    ]
-
-    for query in base_queries:
-        queries.append(f"Previous assessment recommendation {query}")
-
-    return [
-        truncate_query(query, config.max_query_chars)
-        for query in dedupe_keep_order(queries)
-    ][: config.max_queries_per_corpus]
-
-
-def build_corpus_tasks(
-    bundle: FolderBundle,
-    config: RetrievalServiceConfig,
-) -> List[CorpusQueryTask]:
-    tasks = []
-
-    if config.sap_notes_corpus_id:
-        for query in build_sap_notes_queries(bundle, config):
-            tasks.append(
-                CorpusQueryTask(
-                    corpus_id=config.sap_notes_corpus_id,
-                    corpus_name="sap_notes",
-                    citation_type=CitationType.SAP_NOTE,
-                    query=query,
-                )
-            )
-
-    if config.sap_rule_book_corpus_id:
-        for query in build_gcp_rule_book_queries(bundle, config):
-            tasks.append(
-                CorpusQueryTask(
-                    corpus_id=config.sap_rule_book_corpus_id,
-                    corpus_name="gcp_rule_book",
-                    citation_type=CitationType.GCP_RULE_BOOK,
-                    query=query,
-                )
-            )
-
-    if config.include_previous_reports and config.sap_previous_reports_corpus_id:
-        for query in build_previous_report_queries(bundle, config):
-            tasks.append(
-                CorpusQueryTask(
-                    corpus_id=config.sap_previous_reports_corpus_id,
-                    corpus_name="previous_reports",
-                    citation_type=CitationType.PREVIOUS_ASSESSMENT_REPORT,
-                    query=query,
-                )
-            )
-
-    return tasks
-
-
-def run_single_corpus_query(
-    task: CorpusQueryTask,
-    config: RetrievalServiceConfig,
-) -> List[RetrievalHit]:
-    response = query_rag_corpus(
-        corpus_id=task.corpus_id,
-        query_text=task.query,
-        top_k=config.top_k,
-        vector_distance_threshold=config.vector_distance_threshold,
-    )
-
-    if not isinstance(response, dict):
-        return []
-
-    if response.get("status") != "success":
-        return []
-
-    hits = []
-
-    for item in response.get("results", []) or []:
-        text = normalize_text(str(item.get("text") or ""))
-
-        if not text:
-            continue
-
-        relevance_score = item.get("relevance_score")
-
-        try:
-            relevance_score = float(relevance_score) if relevance_score is not None else None
-        except (TypeError, ValueError):
-            relevance_score = None
-
-        hits.append(
-            RetrievalHit(
-                citation_type=task.citation_type,
-                corpus_id=task.corpus_id,
-                corpus_name=task.corpus_name,
-                query=task.query,
-                text=text,
-                source_uri=item.get("source_uri"),
-                source_title=item.get("source_title"),
-                relevance_score=relevance_score,
-                metadata={
-                    key: value
-                    for key, value in item.items()
-                    if key
-                    not in {
-                        "text",
-                        "source_uri",
-                        "source_title",
-                        "relevance_score",
-                    }
-                },
-            )
+def progress_event_to_text_callback(
+    callback: ProgressCallback,
+    event_type: ProgressEventType,
+    vm_name: Optional[str] = None,
+    folder_name: Optional[str] = None,
+) -> Callable[[str], None]:
+    def inner(message: str) -> None:
+        emit_progress(
+            callback=callback,
+            event_type=event_type,
+            status=ProcessingStatus.RUNNING,
+            message=message,
+            vm_name=vm_name,
+            folder_name=folder_name,
         )
 
-    return hits
+    return inner
 
 
-def hit_dedupe_key(hit: RetrievalHit) -> Tuple[str, str, str]:
-    return (
-        hit.citation_type.value,
-        hit.source_uri or "",
-        normalize_text(hit.text[:300]).lower(),
+def source_file_metadata_from_bundle(bundle: FolderBundle) -> List[SourceFileMetadata]:
+    return [
+        SourceFileMetadata(
+            gcs_uri=item.gcs_uri,
+            relative_path=item.relative_path,
+            folder_relative_path=item.folder_relative_path,
+            filename=item.filename,
+            lines_read=item.lines_read,
+            truncated=item.truncated,
+        )
+        for item in bundle.included_files
+    ]
+
+
+def default_retrieval_callable(_: FolderBundle) -> RetrievalContext:
+    return RetrievalContext()
+
+
+def default_vm_consolidation_callable(
+    consolidation_input: VMConsolidationInput,
+) -> VMRecommendationOutput:
+    recommendations = []
+    checklist = []
+    warnings = []
+
+    for folder_output in consolidation_input.folder_outputs:
+        recommendations.extend(folder_output.recommendations)
+        checklist.extend(folder_output.compliance_checklist)
+        warnings.extend(folder_output.warnings)
+
+    executive_summary = (
+        f"Processed {len(consolidation_input.folder_outputs)} folder-level "
+        f"recommendation output(s) for VM {consolidation_input.vm_name}."
+    )
+
+    return VMRecommendationOutput(
+        vm_name=consolidation_input.vm_name,
+        vm_gcs_prefix=consolidation_input.vm_gcs_prefix,
+        executive_summary=executive_summary,
+        folder_outputs=consolidation_input.folder_outputs,
+        consolidated_recommendations=recommendations,
+        consolidated_compliance_checklist=checklist,
+        duplicate_or_merged_findings=[],
+        unresolved_items=[],
+        warnings=warnings,
     )
 
 
-def dedupe_hits(hits: Sequence[RetrievalHit]) -> List[RetrievalHit]:
-    seen = set()
-    output = []
+def process_folder_bundle(
+    root_gcs_uri: str,
+    bundle: FolderBundle,
+    retrieval_callable: RetrievalCallable,
+    folder_llm_callable: FolderLLMCallable,
+    max_lines_per_file: int,
+    progress_callback: ProgressCallback = None,
+) -> FolderRecommendationOutput:
+    emit_progress(
+        callback=progress_callback,
+        event_type=ProgressEventType.FOLDER_PROCESSING,
+        status=ProcessingStatus.STARTED,
+        message=f"VM {bundle.vm_name} / folder {bundle.folder_relative_path}: started folder processing.",
+        vm_name=bundle.vm_name,
+        folder_name=bundle.folder_relative_path,
+    )
 
-    for hit in hits:
-        key = hit_dedupe_key(hit)
+    emit_progress(
+        callback=progress_callback,
+        event_type=ProgressEventType.RETRIEVAL,
+        status=ProcessingStatus.RUNNING,
+        message=f"VM {bundle.vm_name} / folder {bundle.folder_relative_path}: running retrieval.",
+        vm_name=bundle.vm_name,
+        folder_name=bundle.folder_relative_path,
+    )
 
-        if key in seen:
-            continue
+    retrieval_context = retrieval_callable(bundle)
 
-        seen.add(key)
-        output.append(hit)
+    emit_progress(
+        callback=progress_callback,
+        event_type=ProgressEventType.RETRIEVAL,
+        status=ProcessingStatus.COMPLETED,
+        message=f"VM {bundle.vm_name} / folder {bundle.folder_relative_path}: retrieval completed.",
+        vm_name=bundle.vm_name,
+        folder_name=bundle.folder_relative_path,
+        details={
+            "sap_notes_hits": len(retrieval_context.sap_notes_hits),
+            "gcp_rule_book_hits": len(retrieval_context.gcp_rule_book_hits),
+            "previous_report_hits": len(retrieval_context.previous_report_hits),
+            "google_search_hits": len(retrieval_context.google_search_hits),
+            "other_hits": len(retrieval_context.other_hits),
+        },
+    )
 
-    return output
+    folder_input = FolderAnalysisInput(
+        root_gcs_uri=root_gcs_uri,
+        vm_name=bundle.vm_name,
+        folder_relative_path=bundle.folder_relative_path,
+        folder_gcs_prefix=bundle.folder_gcs_prefix,
+        source_files=source_file_metadata_from_bundle(bundle),
+        combined_folder_text=bundle.combined_text,
+        retrieval_context=retrieval_context,
+        max_lines_per_file=max_lines_per_file,
+        processing_notes=[
+            "Only the configured number of lines per selected file were included.",
+            "Files ignored by deterministic filter rules were not sent for recommendation generation.",
+        ],
+    )
+
+    emit_progress(
+        callback=progress_callback,
+        event_type=ProgressEventType.LLM_GENERATION,
+        status=ProcessingStatus.RUNNING,
+        message=f"VM {bundle.vm_name} / folder {bundle.folder_relative_path}: generating folder recommendation.",
+        vm_name=bundle.vm_name,
+        folder_name=bundle.folder_relative_path,
+    )
+
+    folder_output = folder_llm_callable(folder_input)
+
+    if folder_output.vm_name != bundle.vm_name:
+        folder_output.vm_name = bundle.vm_name
+
+    if folder_output.folder_relative_path != bundle.folder_relative_path:
+        folder_output.folder_relative_path = bundle.folder_relative_path
+
+    if not folder_output.files_analyzed:
+        folder_output.files_analyzed = folder_input.source_files
+
+    if not folder_output.retrieval_context_used:
+        folder_output.retrieval_context_used = retrieval_context
+
+    emit_progress(
+        callback=progress_callback,
+        event_type=ProgressEventType.LLM_GENERATION,
+        status=ProcessingStatus.COMPLETED,
+        message=f"VM {bundle.vm_name} / folder {bundle.folder_relative_path}: folder recommendation generated.",
+        vm_name=bundle.vm_name,
+        folder_name=bundle.folder_relative_path,
+        details={
+            "observed_facts": len(folder_output.observed_facts),
+            "recommendations": len(folder_output.recommendations),
+            "checklist_items": len(folder_output.compliance_checklist),
+        },
+    )
+
+    emit_progress(
+        callback=progress_callback,
+        event_type=ProgressEventType.FOLDER_PROCESSING,
+        status=ProcessingStatus.COMPLETED,
+        message=f"VM {bundle.vm_name} / folder {bundle.folder_relative_path}: completed folder processing.",
+        vm_name=bundle.vm_name,
+        folder_name=bundle.folder_relative_path,
+    )
+
+    return folder_output
 
 
-def sort_hits(hits: Sequence[RetrievalHit]) -> List[RetrievalHit]:
-    return sorted(
-        hits,
-        key=lambda hit: (
-            hit.relevance_score is None,
-            hit.relevance_score if hit.relevance_score is not None else 999999.0,
+def process_vm_folder(
+    root_gcs_uri: str,
+    bucket_name: str,
+    vm_name: str,
+    vm_prefix: str,
+    client: storage.Client,
+    retrieval_callable: RetrievalCallable,
+    folder_llm_callable: FolderLLMCallable,
+    vm_consolidation_callable: VMConsolidationCallable,
+    max_lines_per_file: int = DEFAULT_MAX_LINES_PER_FILE,
+    continue_on_folder_error: bool = True,
+    progress_callback: ProgressCallback = None,
+) -> VMProcessingResult:
+    emit_progress(
+        callback=progress_callback,
+        event_type=ProgressEventType.VM_PROCESSING,
+        status=ProcessingStatus.STARTED,
+        message=f"VM {vm_name}: started processing.",
+        vm_name=vm_name,
+    )
+
+    ingestion_result = ingest_vm_folder(
+        bucket_name=bucket_name,
+        vm_name=vm_name,
+        vm_prefix=vm_prefix,
+        client=client,
+        max_lines_per_file=max_lines_per_file,
+        progress_callback=progress_event_to_text_callback(
+            callback=progress_callback,
+            event_type=ProgressEventType.FILE_READING,
+            vm_name=vm_name,
         ),
     )
 
+    folder_outputs: List[FolderRecommendationOutput] = []
+    folder_errors: List[str] = []
 
-def group_hits_by_type(hits: Sequence[RetrievalHit]) -> Dict[CitationType, List[RetrievalHit]]:
-    grouped: Dict[CitationType, List[RetrievalHit]] = {}
+    total_folders = len(ingestion_result.folder_bundles)
 
-    for hit in hits:
-        grouped.setdefault(hit.citation_type, []).append(hit)
+    for index, bundle in enumerate(ingestion_result.folder_bundles, start=1):
+        emit_progress(
+            callback=progress_callback,
+            event_type=ProgressEventType.FOLDER_PROCESSING,
+            status=ProcessingStatus.RUNNING,
+            message=f"VM {vm_name}: processing folder {index}/{total_folders}: {bundle.folder_relative_path}.",
+            vm_name=vm_name,
+            folder_name=bundle.folder_relative_path,
+            current=index,
+            total=total_folders,
+        )
 
-    return grouped
+        try:
+            folder_output = process_folder_bundle(
+                root_gcs_uri=root_gcs_uri,
+                bundle=bundle,
+                retrieval_callable=retrieval_callable,
+                folder_llm_callable=folder_llm_callable,
+                max_lines_per_file=max_lines_per_file,
+                progress_callback=progress_callback,
+            )
+            folder_outputs.append(folder_output)
+        except Exception as exc:
+            error_message = (
+                f"VM {vm_name} / folder {bundle.folder_relative_path}: "
+                f"folder processing failed: {exc}"
+            )
+            folder_errors.append(error_message)
 
+            emit_progress(
+                callback=progress_callback,
+                event_type=ProgressEventType.FOLDER_PROCESSING,
+                status=ProcessingStatus.FAILED,
+                message=error_message,
+                vm_name=vm_name,
+                folder_name=bundle.folder_relative_path,
+            )
 
-def build_retrieval_context(
-    bundle: FolderBundle,
-    config: Optional[RetrievalServiceConfig] = None,
-) -> RetrievalContext:
-    config = config or get_default_config()
-    tasks = build_corpus_tasks(bundle, config)
+            if not continue_on_folder_error:
+                raise FolderOrchestrationError(error_message) from exc
 
-    if not tasks:
-        return RetrievalContext()
+    emit_progress(
+        callback=progress_callback,
+        event_type=ProgressEventType.VM_CONSOLIDATION,
+        status=ProcessingStatus.RUNNING,
+        message=f"VM {vm_name}: consolidating folder outputs.",
+        vm_name=vm_name,
+    )
 
-    all_hits: List[RetrievalHit] = []
+    consolidation_input = VMConsolidationInput(
+        root_gcs_uri=root_gcs_uri,
+        vm_name=vm_name,
+        vm_gcs_prefix=vm_prefix,
+        folder_outputs=folder_outputs,
+        processing_notes=folder_errors,
+    )
 
-    max_workers = max(1, min(config.max_workers, len(tasks)))
+    vm_output = vm_consolidation_callable(consolidation_input)
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_task = {
-            executor.submit(run_single_corpus_query, task, config): task
-            for task in tasks
-        }
+    if folder_errors:
+        vm_output.warnings.extend(folder_errors)
 
-        for future in as_completed(future_to_task):
-            try:
-                all_hits.extend(future.result())
-            except Exception:
-                continue
+    emit_progress(
+        callback=progress_callback,
+        event_type=ProgressEventType.VM_CONSOLIDATION,
+        status=ProcessingStatus.COMPLETED,
+        message=f"VM {vm_name}: consolidation completed.",
+        vm_name=vm_name,
+        details={
+            "folder_outputs": len(folder_outputs),
+            "consolidated_recommendations": len(vm_output.consolidated_recommendations),
+            "consolidated_checklist_items": len(vm_output.consolidated_compliance_checklist),
+            "folder_errors": len(folder_errors),
+        },
+    )
 
-    all_hits = sort_hits(dedupe_hits(all_hits))
-    grouped = group_hits_by_type(all_hits)
+    emit_progress(
+        callback=progress_callback,
+        event_type=ProgressEventType.VM_PROCESSING,
+        status=ProcessingStatus.COMPLETED,
+        message=f"VM {vm_name}: completed processing.",
+        vm_name=vm_name,
+    )
 
-    return RetrievalContext(
-        sap_notes_hits=grouped.get(CitationType.SAP_NOTE, []),
-        gcp_rule_book_hits=grouped.get(CitationType.GCP_RULE_BOOK, []),
-        previous_report_hits=grouped.get(CitationType.PREVIOUS_ASSESSMENT_REPORT, []),
-        google_search_hits=grouped.get(CitationType.GOOGLE_SEARCH, []),
-        other_hits=grouped.get(CitationType.OTHER, []),
-        search_queries_used=dedupe_keep_order(task.query for task in tasks),
+    return VMProcessingResult(
+        vm_name=vm_name,
+        ingestion_result=ingestion_result,
+        folder_outputs=folder_outputs,
+        vm_output=vm_output,
     )
 
 
-class RetrievalService:
-    def __init__(self, config: Optional[RetrievalServiceConfig] = None):
-        self.config = config or get_default_config()
+def build_pipeline_summary(
+    root_gcs_uri: str,
+    vm_folders_found: int,
+    vm_results: List[VMProcessingResult],
+    max_lines_per_file: int,
+    started_at_utc: datetime,
+    completed_at_utc: datetime,
+    errors: Optional[List[str]] = None,
+) -> PipelineProcessingSummary:
+    total_actual_folders_processed = 0
+    total_files_included = 0
+    total_files_ignored = 0
+    total_files_truncated = 0
 
-    def build_context(self, bundle: FolderBundle) -> RetrievalContext:
-        return build_retrieval_context(bundle=bundle, config=self.config)
+    for vm_result in vm_results:
+        ingestion_result = vm_result.ingestion_result
+        total_actual_folders_processed += len(ingestion_result.folder_bundles)
+        total_files_included += ingestion_result.included_file_count
+        total_files_ignored += ingestion_result.ignored_file_count
 
-    def __call__(self, bundle: FolderBundle) -> RetrievalContext:
-        return self.build_context(bundle)
+        for bundle in ingestion_result.folder_bundles:
+            for included_file in bundle.included_files:
+                if included_file.truncated:
+                    total_files_truncated += 1
+
+    status = ProcessingStatus.COMPLETED if not errors else ProcessingStatus.FAILED
+
+    return PipelineProcessingSummary(
+        root_gcs_uri=root_gcs_uri,
+        total_vm_folders_found=vm_folders_found,
+        total_vm_folders_processed=len(vm_results),
+        total_actual_folders_processed=total_actual_folders_processed,
+        total_files_included=total_files_included,
+        total_files_ignored=total_files_ignored,
+        total_files_truncated=total_files_truncated,
+        max_lines_per_file=max_lines_per_file,
+        started_at_utc=started_at_utc,
+        completed_at_utc=completed_at_utc,
+        status=status,
+        errors=errors or [],
+    )
 
 
-def create_retrieval_callable(
-    config: Optional[RetrievalServiceConfig] = None,
-) -> RetrievalService:
-    return RetrievalService(config=config)
+def run_folder_orchestration(
+    config: OrchestratorConfig,
+    folder_llm_callable: FolderLLMCallable,
+    retrieval_callable: Optional[RetrievalCallable] = None,
+    vm_consolidation_callable: Optional[VMConsolidationCallable] = None,
+    storage_client: Optional[storage.Client] = None,
+    progress_callback: ProgressCallback = None,
+) -> PipelineResult:
+    started_at_utc = datetime.now(timezone.utc)
+    retrieval_callable = retrieval_callable or default_retrieval_callable
+    vm_consolidation_callable = (
+        vm_consolidation_callable or default_vm_consolidation_callable
+    )
+    storage_client = storage_client or storage.Client()
 
+    emit_progress(
+        callback=progress_callback,
+        event_type=ProgressEventType.PIPELINE,
+        status=ProcessingStatus.STARTED,
+        message=f"Pipeline started for root path: {config.root_gcs_uri}",
+    )
 
-def retrieval_context_to_text(context: RetrievalContext) -> str:
-    sections = []
+    gcs_path = parse_gcs_uri(config.root_gcs_uri)
 
-    def add_section(title: str, hits: List[RetrievalHit]) -> None:
-        if not hits:
-            return
+    emit_progress(
+        callback=progress_callback,
+        event_type=ProgressEventType.GCS_VALIDATION,
+        status=ProcessingStatus.RUNNING,
+        message=f"Validating GCS root path: {config.root_gcs_uri}",
+    )
 
-        sections.append(f"\n## {title}\n")
+    vm_prefixes = list_vm_prefixes(
+        root_gcs_uri=config.root_gcs_uri,
+        client=storage_client,
+        progress_callback=progress_event_to_text_callback(
+            callback=progress_callback,
+            event_type=ProgressEventType.VM_DISCOVERY,
+        ),
+    )
 
-        for index, hit in enumerate(hits, start=1):
-            source = hit.source_uri or hit.source_title or hit.corpus_name or "unknown source"
-            score = (
-                f"{hit.relevance_score:.4f}"
-                if hit.relevance_score is not None
-                else "N/A"
-            )
-            sections.append(
-                "\n".join(
-                    [
-                        f"### {index}. {source}",
-                        f"Query: {hit.query}",
-                        f"Score: {score}",
-                        hit.text,
-                    ]
+    emit_progress(
+        callback=progress_callback,
+        event_type=ProgressEventType.VM_DISCOVERY,
+        status=ProcessingStatus.COMPLETED,
+        message=f"Discovered {len(vm_prefixes)} VM folder(s).",
+        total=len(vm_prefixes),
+        details={"vm_names": [vm_name for vm_name, _ in vm_prefixes]},
+    )
+
+    vm_results: List[VMProcessingResult] = []
+    errors: List[str] = []
+
+    with ThreadPoolExecutor(max_workers=config.max_vm_workers) as executor:
+        future_to_vm = {
+            executor.submit(
+                process_vm_folder,
+                config.root_gcs_uri,
+                gcs_path.bucket_name,
+                vm_name,
+                vm_prefix,
+                storage_client,
+                retrieval_callable,
+                folder_llm_callable,
+                vm_consolidation_callable,
+                config.max_lines_per_file,
+                config.continue_on_folder_error,
+                progress_callback,
+            ): vm_name
+            for vm_name, vm_prefix in vm_prefixes
+        }
+
+        for future in as_completed(future_to_vm):
+            vm_name = future_to_vm[future]
+
+            try:
+                vm_result = future.result()
+                vm_results.append(vm_result)
+            except Exception as exc:
+                error_message = f"VM {vm_name}: processing failed: {exc}"
+                errors.append(error_message)
+
+                emit_progress(
+                    callback=progress_callback,
+                    event_type=ProgressEventType.VM_PROCESSING,
+                    status=ProcessingStatus.FAILED,
+                    message=error_message,
+                    vm_name=vm_name,
                 )
-            )
 
-    add_section("SAP Notes Context", context.sap_notes_hits)
-    add_section("GCP Rule Book Context", context.gcp_rule_book_hits)
-    add_section("Previous Assessment Reports Context", context.previous_report_hits)
-    add_section("Google Search Context", context.google_search_hits)
-    add_section("Other Context", context.other_hits)
+                if not config.continue_on_vm_error:
+                    raise FolderOrchestrationError(error_message) from exc
 
-    return "\n\n".join(sections).strip()
+    vm_results.sort(key=lambda item: item.vm_name)
+
+    completed_at_utc = datetime.now(timezone.utc)
+
+    processing_summary = build_pipeline_summary(
+        root_gcs_uri=config.root_gcs_uri,
+        vm_folders_found=len(vm_prefixes),
+        vm_results=vm_results,
+        max_lines_per_file=config.max_lines_per_file,
+        started_at_utc=started_at_utc,
+        completed_at_utc=completed_at_utc,
+        errors=errors,
+    )
+
+    report = FinalHealthCheckReport(
+        root_gcs_uri=config.root_gcs_uri,
+        output_gcs_uri=config.output_gcs_uri,
+        processing_summary=processing_summary,
+        vm_reports=[vm_result.vm_output for vm_result in vm_results],
+        global_summary=(
+            f"Processed {len(vm_results)} out of {len(vm_prefixes)} discovered VM folder(s). "
+            f"Generated {sum(len(vm.vm_output.consolidated_recommendations) for vm in vm_results)} consolidated recommendation(s)."
+        ),
+        global_warnings=errors,
+    )
+
+    final_status = ProcessingStatus.COMPLETED if not errors else ProcessingStatus.FAILED
+
+    emit_progress(
+        callback=progress_callback,
+        event_type=ProgressEventType.PIPELINE,
+        status=final_status,
+        message="Pipeline completed." if not errors else "Pipeline completed with errors.",
+        details={
+            "vm_folders_found": len(vm_prefixes),
+            "vm_folders_processed": len(vm_results),
+            "errors": errors,
+        },
+    )
+
+    return PipelineResult(report=report, vm_results=vm_results)
+
+
+def run_folder_orchestration_from_gcs_path(
+    root_gcs_uri: str,
+    folder_llm_callable: FolderLLMCallable,
+    retrieval_callable: Optional[RetrievalCallable] = None,
+    vm_consolidation_callable: Optional[VMConsolidationCallable] = None,
+    output_gcs_uri: Optional[str] = None,
+    max_lines_per_file: int = DEFAULT_MAX_LINES_PER_FILE,
+    max_vm_workers: int = 3,
+    progress_callback: ProgressCallback = None,
+) -> PipelineResult:
+    config = OrchestratorConfig(
+        root_gcs_uri=root_gcs_uri,
+        output_gcs_uri=output_gcs_uri,
+        max_lines_per_file=max_lines_per_file,
+        max_vm_workers=max_vm_workers,
+    )
+
+    return run_folder_orchestration(
+        config=config,
+        folder_llm_callable=folder_llm_callable,
+        retrieval_callable=retrieval_callable,
+        vm_consolidation_callable=vm_consolidation_callable,
+        progress_callback=progress_callback,
+    )
