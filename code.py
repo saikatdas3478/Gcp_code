@@ -1,610 +1,656 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Callable, Dict, List, Optional
+import json
+import os
+from datetime import datetime
+from pathlib import PurePosixPath
+from typing import Callable, List, Optional, Sequence
 
 from google.cloud import storage
 
-from .gcs_ingestion import (
-    DEFAULT_MAX_LINES_PER_FILE,
-    FolderBundle,
-    GCSIngestionError,
-    VMIngestionResult,
-    ingest_vm_folder,
-    list_vm_prefixes,
-    parse_gcs_uri,
-)
+from .gcs_ingestion import GCSIngestionError, parse_gcs_uri
 from .schemas import (
+    CitationType,
+    ComplianceChecklistItem,
+    EvidenceLocation,
     FinalHealthCheckReport,
-    FolderAnalysisInput,
     FolderRecommendationOutput,
+    ObservedFact,
     PipelineProcessingSummary,
-    ProcessingStatus,
-    ProgressEvent,
-    ProgressEventType,
-    RetrievalContext,
-    SourceFileMetadata,
-    VMConsolidationInput,
+    RecommendationItem,
     VMRecommendationOutput,
 )
 
 
-ProgressCallback = Optional[Callable[[ProgressEvent], None]]
-RetrievalCallable = Callable[[FolderBundle], RetrievalContext]
-FolderLLMCallable = Callable[[FolderAnalysisInput], FolderRecommendationOutput]
-VMConsolidationCallable = Callable[[VMConsolidationInput], VMRecommendationOutput]
+ProgressCallback = Optional[Callable[[str], None]]
 
 
-@dataclass
-class FolderProcessingResult:
-    vm_name: str
-    folder_relative_path: str
-    output: FolderRecommendationOutput
-
-
-@dataclass
-class VMProcessingResult:
-    vm_name: str
-    ingestion_result: VMIngestionResult
-    folder_outputs: List[FolderRecommendationOutput]
-    vm_output: VMRecommendationOutput
-
-
-@dataclass
-class PipelineResult:
-    report: FinalHealthCheckReport
-    vm_results: List[VMProcessingResult]
-
-
-@dataclass
-class OrchestratorConfig:
-    root_gcs_uri: str
-    output_gcs_uri: Optional[str] = None
-    max_lines_per_file: int = DEFAULT_MAX_LINES_PER_FILE
-    max_vm_workers: int = 3
-    continue_on_folder_error: bool = True
-    continue_on_vm_error: bool = True
-
-
-class FolderOrchestrationError(Exception):
+class ReportWriterError(Exception):
     pass
 
 
-def emit_progress(
-    callback: ProgressCallback,
-    event_type: ProgressEventType,
-    status: ProcessingStatus,
-    message: str,
-    vm_name: Optional[str] = None,
-    folder_name: Optional[str] = None,
-    current: Optional[int] = None,
-    total: Optional[int] = None,
-    details: Optional[Dict[str, object]] = None,
-) -> None:
-    if callback is None:
-        return
+def emit_progress(callback: ProgressCallback, message: str) -> None:
+    if callback:
+        callback(message)
 
-    callback(
-        ProgressEvent(
-            event_type=event_type,
-            status=status,
-            message=message,
-            vm_name=vm_name,
-            folder_name=folder_name,
-            current=current,
-            total=total,
-            details=details or {},
-        )
+
+def format_datetime(value: Optional[datetime]) -> str:
+    if value is None:
+        return "N/A"
+    return value.isoformat()
+
+
+def safe_text(value: Optional[object]) -> str:
+    if value is None:
+        return "N/A"
+    text = str(value).strip()
+    return text if text else "N/A"
+
+
+def join_list(values: Sequence[str], separator: str = ", ") -> str:
+    cleaned = [str(value).strip() for value in values if str(value).strip()]
+    return separator.join(cleaned) if cleaned else "N/A"
+
+
+def normalize_markdown_cell(value: Optional[object]) -> str:
+    text = safe_text(value)
+    text = text.replace("\n", "<br>")
+    text = text.replace("|", "\\|")
+    return text
+
+
+def evidence_to_text(evidence: EvidenceLocation) -> str:
+    parts: List[str] = []
+
+    parts.append(f"type={evidence.source_type.value}")
+
+    if evidence.source_uri:
+        parts.append(f"source={evidence.source_uri}")
+
+    if evidence.source_title:
+        parts.append(f"title={evidence.source_title}")
+
+    if evidence.file_relative_path:
+        parts.append(f"file={evidence.file_relative_path}")
+
+    if evidence.line_range:
+        parts.append(f"lines={evidence.line_range}")
+
+    if evidence.corpus_id:
+        parts.append(f"corpus={evidence.corpus_id}")
+
+    if evidence.note_number:
+        parts.append(f"note={evidence.note_number}")
+
+    if evidence.rule_id:
+        parts.append(f"rule={evidence.rule_id}")
+
+    if evidence.quote_or_summary:
+        parts.append(f"summary={evidence.quote_or_summary}")
+
+    return "; ".join(parts)
+
+
+def evidence_list_to_text(evidence_items: Sequence[EvidenceLocation]) -> str:
+    if not evidence_items:
+        return "N/A"
+
+    return "<br>".join(
+        f"{index}. {evidence_to_text(item)}"
+        for index, item in enumerate(evidence_items, start=1)
     )
 
 
-def progress_event_to_text_callback(
-    callback: ProgressCallback,
-    event_type: ProgressEventType,
-    vm_name: Optional[str] = None,
-    folder_name: Optional[str] = None,
-) -> Callable[[str], None]:
-    def inner(message: str) -> None:
-        emit_progress(
-            callback=callback,
-            event_type=event_type,
-            status=ProcessingStatus.RUNNING,
-            message=message,
-            vm_name=vm_name,
-            folder_name=folder_name,
-        )
-
-    return inner
-
-
-def source_file_metadata_from_bundle(bundle: FolderBundle) -> List[SourceFileMetadata]:
-    return [
-        SourceFileMetadata(
-            gcs_uri=item.gcs_uri,
-            relative_path=item.relative_path,
-            folder_relative_path=item.folder_relative_path,
-            filename=item.filename,
-            lines_read=item.lines_read,
-            truncated=item.truncated,
-        )
-        for item in bundle.included_files
+def observed_fact_to_text(fact: ObservedFact) -> str:
+    parts = [
+        f"Fact: {fact.fact_name}",
+        f"Observed: {safe_text(fact.observed_value)}",
     ]
 
+    if fact.expected_value:
+        parts.append(f"Expected: {fact.expected_value}")
 
-def default_retrieval_callable(_: FolderBundle) -> RetrievalContext:
-    return RetrievalContext()
+    if fact.unit:
+        parts.append(f"Unit: {fact.unit}")
+
+    parts.append(f"Description: {fact.description}")
+
+    if fact.confidence is not None:
+        parts.append(f"Confidence: {fact.confidence:.2f}")
+
+    if fact.evidence:
+        parts.append(f"Evidence: {evidence_list_to_text(fact.evidence)}")
+
+    return "<br>".join(parts)
 
 
-def default_vm_consolidation_callable(
-    consolidation_input: VMConsolidationInput,
-) -> VMRecommendationOutput:
-    recommendations = []
-    checklist = []
-    warnings = []
+def observed_facts_to_text(facts: Sequence[ObservedFact]) -> str:
+    if not facts:
+        return "N/A"
 
-    for folder_output in consolidation_input.folder_outputs:
-        recommendations.extend(folder_output.recommendations)
-        checklist.extend(folder_output.compliance_checklist)
-        warnings.extend(folder_output.warnings)
-
-    executive_summary = (
-        f"Processed {len(consolidation_input.folder_outputs)} folder-level "
-        f"recommendation output(s) for VM {consolidation_input.vm_name}."
-    )
-
-    return VMRecommendationOutput(
-        vm_name=consolidation_input.vm_name,
-        vm_gcs_prefix=consolidation_input.vm_gcs_prefix,
-        executive_summary=executive_summary,
-        folder_outputs=consolidation_input.folder_outputs,
-        consolidated_recommendations=recommendations,
-        consolidated_compliance_checklist=checklist,
-        duplicate_or_merged_findings=[],
-        unresolved_items=[],
-        warnings=warnings,
+    return "<br><br>".join(
+        f"{index}. {observed_fact_to_text(fact)}"
+        for index, fact in enumerate(facts, start=1)
     )
 
 
-def process_folder_bundle(
-    root_gcs_uri: str,
-    bundle: FolderBundle,
-    retrieval_callable: RetrievalCallable,
-    folder_llm_callable: FolderLLMCallable,
-    max_lines_per_file: int,
-    progress_callback: ProgressCallback = None,
-) -> FolderRecommendationOutput:
-    emit_progress(
-        callback=progress_callback,
-        event_type=ProgressEventType.FOLDER_PROCESSING,
-        status=ProcessingStatus.STARTED,
-        message=f"VM {bundle.vm_name} / folder {bundle.folder_relative_path}: started folder processing.",
-        vm_name=bundle.vm_name,
-        folder_name=bundle.folder_relative_path,
-    )
+def recommendation_to_markdown_table_rows(
+    recommendations: Sequence[RecommendationItem],
+) -> List[str]:
+    rows: List[str] = []
 
-    emit_progress(
-        callback=progress_callback,
-        event_type=ProgressEventType.RETRIEVAL,
-        status=ProcessingStatus.RUNNING,
-        message=f"VM {bundle.vm_name} / folder {bundle.folder_relative_path}: running retrieval.",
-        vm_name=bundle.vm_name,
-        folder_name=bundle.folder_relative_path,
-    )
-
-    retrieval_context = retrieval_callable(bundle)
-
-    emit_progress(
-        callback=progress_callback,
-        event_type=ProgressEventType.RETRIEVAL,
-        status=ProcessingStatus.COMPLETED,
-        message=f"VM {bundle.vm_name} / folder {bundle.folder_relative_path}: retrieval completed.",
-        vm_name=bundle.vm_name,
-        folder_name=bundle.folder_relative_path,
-        details={
-            "sap_notes_hits": len(retrieval_context.sap_notes_hits),
-            "gcp_rule_book_hits": len(retrieval_context.gcp_rule_book_hits),
-            "previous_report_hits": len(retrieval_context.previous_report_hits),
-            "google_search_hits": len(retrieval_context.google_search_hits),
-            "other_hits": len(retrieval_context.other_hits),
-        },
-    )
-
-    folder_input = FolderAnalysisInput(
-        root_gcs_uri=root_gcs_uri,
-        vm_name=bundle.vm_name,
-        folder_relative_path=bundle.folder_relative_path,
-        folder_gcs_prefix=bundle.folder_gcs_prefix,
-        source_files=source_file_metadata_from_bundle(bundle),
-        combined_folder_text=bundle.combined_text,
-        retrieval_context=retrieval_context,
-        max_lines_per_file=max_lines_per_file,
-        processing_notes=[
-            "Only the configured number of lines per selected file were included.",
-            "Files ignored by deterministic filter rules were not sent for recommendation generation.",
-        ],
-    )
-
-    emit_progress(
-        callback=progress_callback,
-        event_type=ProgressEventType.LLM_GENERATION,
-        status=ProcessingStatus.RUNNING,
-        message=f"VM {bundle.vm_name} / folder {bundle.folder_relative_path}: generating folder recommendation.",
-        vm_name=bundle.vm_name,
-        folder_name=bundle.folder_relative_path,
-    )
-
-    folder_output = folder_llm_callable(folder_input)
-
-    if folder_output.vm_name != bundle.vm_name:
-        folder_output.vm_name = bundle.vm_name
-
-    if folder_output.folder_relative_path != bundle.folder_relative_path:
-        folder_output.folder_relative_path = bundle.folder_relative_path
-
-    if not folder_output.files_analyzed:
-        folder_output.files_analyzed = folder_input.source_files
-
-    if not folder_output.retrieval_context_used:
-        folder_output.retrieval_context_used = retrieval_context
-
-    emit_progress(
-        callback=progress_callback,
-        event_type=ProgressEventType.LLM_GENERATION,
-        status=ProcessingStatus.COMPLETED,
-        message=f"VM {bundle.vm_name} / folder {bundle.folder_relative_path}: folder recommendation generated.",
-        vm_name=bundle.vm_name,
-        folder_name=bundle.folder_relative_path,
-        details={
-            "observed_facts": len(folder_output.observed_facts),
-            "recommendations": len(folder_output.recommendations),
-            "checklist_items": len(folder_output.compliance_checklist),
-        },
-    )
-
-    emit_progress(
-        callback=progress_callback,
-        event_type=ProgressEventType.FOLDER_PROCESSING,
-        status=ProcessingStatus.COMPLETED,
-        message=f"VM {bundle.vm_name} / folder {bundle.folder_relative_path}: completed folder processing.",
-        vm_name=bundle.vm_name,
-        folder_name=bundle.folder_relative_path,
-    )
-
-    return folder_output
-
-
-def process_vm_folder(
-    root_gcs_uri: str,
-    bucket_name: str,
-    vm_name: str,
-    vm_prefix: str,
-    client: storage.Client,
-    retrieval_callable: RetrievalCallable,
-    folder_llm_callable: FolderLLMCallable,
-    vm_consolidation_callable: VMConsolidationCallable,
-    max_lines_per_file: int = DEFAULT_MAX_LINES_PER_FILE,
-    continue_on_folder_error: bool = True,
-    progress_callback: ProgressCallback = None,
-) -> VMProcessingResult:
-    emit_progress(
-        callback=progress_callback,
-        event_type=ProgressEventType.VM_PROCESSING,
-        status=ProcessingStatus.STARTED,
-        message=f"VM {vm_name}: started processing.",
-        vm_name=vm_name,
-    )
-
-    ingestion_result = ingest_vm_folder(
-        bucket_name=bucket_name,
-        vm_name=vm_name,
-        vm_prefix=vm_prefix,
-        client=client,
-        max_lines_per_file=max_lines_per_file,
-        progress_callback=progress_event_to_text_callback(
-            callback=progress_callback,
-            event_type=ProgressEventType.FILE_READING,
-            vm_name=vm_name,
-        ),
-    )
-
-    folder_outputs: List[FolderRecommendationOutput] = []
-    folder_errors: List[str] = []
-
-    total_folders = len(ingestion_result.folder_bundles)
-
-    for index, bundle in enumerate(ingestion_result.folder_bundles, start=1):
-        emit_progress(
-            callback=progress_callback,
-            event_type=ProgressEventType.FOLDER_PROCESSING,
-            status=ProcessingStatus.RUNNING,
-            message=f"VM {vm_name}: processing folder {index}/{total_folders}: {bundle.folder_relative_path}.",
-            vm_name=vm_name,
-            folder_name=bundle.folder_relative_path,
-            current=index,
-            total=total_folders,
+    for item in recommendations:
+        rows.append(
+            "| "
+            + " | ".join(
+                [
+                    normalize_markdown_cell(item.recommendation_id),
+                    normalize_markdown_cell(item.title),
+                    normalize_markdown_cell(item.category.value),
+                    normalize_markdown_cell(item.severity.value),
+                    normalize_markdown_cell(observed_facts_to_text(item.observed_facts)),
+                    normalize_markdown_cell(item.recommendation),
+                    normalize_markdown_cell(item.reason),
+                    normalize_markdown_cell(item.business_or_technical_impact),
+                    normalize_markdown_cell("<br>".join(item.remediation_steps) if item.remediation_steps else "N/A"),
+                    normalize_markdown_cell(evidence_list_to_text(item.citations)),
+                    normalize_markdown_cell(f"{item.confidence:.2f}" if item.confidence is not None else "N/A"),
+                ]
+            )
+            + " |"
         )
 
-        try:
-            folder_output = process_folder_bundle(
-                root_gcs_uri=root_gcs_uri,
-                bundle=bundle,
-                retrieval_callable=retrieval_callable,
-                folder_llm_callable=folder_llm_callable,
-                max_lines_per_file=max_lines_per_file,
-                progress_callback=progress_callback,
+    return rows
+
+
+def render_recommendations_section(
+    title: str,
+    recommendations: Sequence[RecommendationItem],
+) -> str:
+    lines: List[str] = [f"### {title}", ""]
+
+    if not recommendations:
+        lines.append("No recommendations generated.")
+        lines.append("")
+        return "\n".join(lines)
+
+    lines.extend(
+        [
+            "| ID | Title | Category | Severity | Observed Facts | Recommendation | Reason | Impact | Remediation Steps | Citations | Confidence |",
+            "|---|---|---|---|---|---|---|---|---|---|---|",
+        ]
+    )
+
+    lines.extend(recommendation_to_markdown_table_rows(recommendations))
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def compliance_to_markdown_table_rows(
+    checklist: Sequence[ComplianceChecklistItem],
+) -> List[str]:
+    rows: List[str] = []
+
+    for item in checklist:
+        rows.append(
+            "| "
+            + " | ".join(
+                [
+                    normalize_markdown_cell(item.rule_id),
+                    normalize_markdown_cell(item.rule_name),
+                    normalize_markdown_cell(item.parameter_or_check),
+                    normalize_markdown_cell(item.expected_value),
+                    normalize_markdown_cell(item.observed_value),
+                    normalize_markdown_cell(item.compliance_state.value),
+                    normalize_markdown_cell(item.reason),
+                    normalize_markdown_cell(join_list(item.related_recommendation_ids)),
+                    normalize_markdown_cell(evidence_list_to_text(item.citations)),
+                ]
             )
-            folder_outputs.append(folder_output)
-        except Exception as exc:
-            error_message = (
-                f"VM {vm_name} / folder {bundle.folder_relative_path}: "
-                f"folder processing failed: {exc}"
+            + " |"
+        )
+
+    return rows
+
+
+def render_compliance_section(
+    title: str,
+    checklist: Sequence[ComplianceChecklistItem],
+) -> str:
+    lines: List[str] = [f"### {title}", ""]
+
+    if not checklist:
+        lines.append("No compliance checklist items generated.")
+        lines.append("")
+        return "\n".join(lines)
+
+    lines.extend(
+        [
+            "| Rule ID | Rule Name | Parameter / Check | Expected Value | Observed Value | State | Reason | Related Recommendations | Citations |",
+            "|---|---|---|---|---|---|---|---|---|",
+        ]
+    )
+
+    lines.extend(compliance_to_markdown_table_rows(checklist))
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def render_observed_facts_section(
+    facts: Sequence[ObservedFact],
+) -> str:
+    lines: List[str] = ["### Observed Facts", ""]
+
+    if not facts:
+        lines.append("No observed facts generated.")
+        lines.append("")
+        return "\n".join(lines)
+
+    lines.extend(
+        [
+            "| Fact | Observed Value | Expected Value | Unit | Description | Evidence | Confidence |",
+            "|---|---|---|---|---|---|---|",
+        ]
+    )
+
+    for fact in facts:
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    normalize_markdown_cell(fact.fact_name),
+                    normalize_markdown_cell(fact.observed_value),
+                    normalize_markdown_cell(fact.expected_value),
+                    normalize_markdown_cell(fact.unit),
+                    normalize_markdown_cell(fact.description),
+                    normalize_markdown_cell(evidence_list_to_text(fact.evidence)),
+                    normalize_markdown_cell(f"{fact.confidence:.2f}" if fact.confidence is not None else "N/A"),
+                ]
             )
-            folder_errors.append(error_message)
+            + " |"
+        )
 
-            emit_progress(
-                callback=progress_callback,
-                event_type=ProgressEventType.FOLDER_PROCESSING,
-                status=ProcessingStatus.FAILED,
-                message=error_message,
-                vm_name=vm_name,
-                folder_name=bundle.folder_relative_path,
+    lines.append("")
+    return "\n".join(lines)
+
+
+def render_files_analyzed_section(folder_output: FolderRecommendationOutput) -> str:
+    lines: List[str] = ["### Files Analyzed", ""]
+
+    if not folder_output.files_analyzed:
+        lines.append("No file metadata available.")
+        lines.append("")
+        return "\n".join(lines)
+
+    lines.extend(
+        [
+            "| File | GCS URI | Lines Read | Truncated |",
+            "|---|---|---|---|",
+        ]
+    )
+
+    for item in folder_output.files_analyzed:
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    normalize_markdown_cell(item.relative_path),
+                    normalize_markdown_cell(item.gcs_uri),
+                    normalize_markdown_cell(item.lines_read),
+                    normalize_markdown_cell("Yes" if item.truncated else "No"),
+                ]
             )
+            + " |"
+        )
 
-            if not continue_on_folder_error:
-                raise FolderOrchestrationError(error_message) from exc
-
-    emit_progress(
-        callback=progress_callback,
-        event_type=ProgressEventType.VM_CONSOLIDATION,
-        status=ProcessingStatus.RUNNING,
-        message=f"VM {vm_name}: consolidating folder outputs.",
-        vm_name=vm_name,
-    )
-
-    consolidation_input = VMConsolidationInput(
-        root_gcs_uri=root_gcs_uri,
-        vm_name=vm_name,
-        vm_gcs_prefix=vm_prefix,
-        folder_outputs=folder_outputs,
-        processing_notes=folder_errors,
-    )
-
-    vm_output = vm_consolidation_callable(consolidation_input)
-
-    if folder_errors:
-        vm_output.warnings.extend(folder_errors)
-
-    emit_progress(
-        callback=progress_callback,
-        event_type=ProgressEventType.VM_CONSOLIDATION,
-        status=ProcessingStatus.COMPLETED,
-        message=f"VM {vm_name}: consolidation completed.",
-        vm_name=vm_name,
-        details={
-            "folder_outputs": len(folder_outputs),
-            "consolidated_recommendations": len(vm_output.consolidated_recommendations),
-            "consolidated_checklist_items": len(vm_output.consolidated_compliance_checklist),
-            "folder_errors": len(folder_errors),
-        },
-    )
-
-    emit_progress(
-        callback=progress_callback,
-        event_type=ProgressEventType.VM_PROCESSING,
-        status=ProcessingStatus.COMPLETED,
-        message=f"VM {vm_name}: completed processing.",
-        vm_name=vm_name,
-    )
-
-    return VMProcessingResult(
-        vm_name=vm_name,
-        ingestion_result=ingestion_result,
-        folder_outputs=folder_outputs,
-        vm_output=vm_output,
-    )
+    lines.append("")
+    return "\n".join(lines)
 
 
-def build_pipeline_summary(
+def render_folder_output(folder_output: FolderRecommendationOutput) -> str:
+    lines: List[str] = [
+        f"## Folder: {folder_output.folder_relative_path}",
+        "",
+        f"**Summary:** {folder_output.short_summary}",
+        "",
+    ]
+
+    lines.append(render_files_analyzed_section(folder_output))
+    lines.append(render_observed_facts_section(folder_output.observed_facts))
+    lines.append(render_recommendations_section("Folder Recommendations", folder_output.recommendations))
+    lines.append(render_compliance_section("Folder Compliance Checklist", folder_output.compliance_checklist))
+
+    if folder_output.warnings:
+        lines.append("### Warnings")
+        lines.append("")
+        for warning in folder_output.warnings:
+            lines.append(f"- {warning}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def render_vm_output(vm_output: VMRecommendationOutput) -> str:
+    lines: List[str] = [
+        f"# VM: {vm_output.vm_name}",
+        "",
+        f"**VM GCS Prefix:** `{vm_output.vm_gcs_prefix}`",
+        "",
+        f"**Executive Summary:** {vm_output.executive_summary}",
+        "",
+    ]
+
+    lines.append(render_recommendations_section("Consolidated VM Recommendations", vm_output.consolidated_recommendations))
+    lines.append(render_compliance_section("Consolidated VM Compliance Checklist", vm_output.consolidated_compliance_checklist))
+
+    if vm_output.duplicate_or_merged_findings:
+        lines.append("### Duplicate or Merged Findings")
+        lines.append("")
+        for item in vm_output.duplicate_or_merged_findings:
+            lines.append(f"- {item}")
+        lines.append("")
+
+    if vm_output.unresolved_items:
+        lines.append("### Unresolved Items")
+        lines.append("")
+        for item in vm_output.unresolved_items:
+            lines.append(f"- {item}")
+        lines.append("")
+
+    if vm_output.warnings:
+        lines.append("### VM Warnings")
+        lines.append("")
+        for warning in vm_output.warnings:
+            lines.append(f"- {warning}")
+        lines.append("")
+
+    if vm_output.folder_outputs:
+        lines.append("# Folder-Level Details")
+        lines.append("")
+
+        for folder_output in vm_output.folder_outputs:
+            lines.append(render_folder_output(folder_output))
+
+    return "\n".join(lines)
+
+
+def render_processing_summary(summary: PipelineProcessingSummary) -> str:
+    lines = [
+        "# Processing Summary",
+        "",
+        f"- Root GCS URI: `{summary.root_gcs_uri}`",
+        f"- Status: `{summary.status.value}`",
+        f"- VM folders found: {summary.total_vm_folders_found}",
+        f"- VM folders processed: {summary.total_vm_folders_processed}",
+        f"- Actual folders processed: {summary.total_actual_folders_processed}",
+        f"- Files included: {summary.total_files_included}",
+        f"- Files ignored: {summary.total_files_ignored}",
+        f"- Files truncated: {summary.total_files_truncated}",
+        f"- Max lines per file: {summary.max_lines_per_file}",
+        f"- Started at UTC: {format_datetime(summary.started_at_utc)}",
+        f"- Completed at UTC: {format_datetime(summary.completed_at_utc)}",
+        "",
+    ]
+
+    if summary.errors:
+        lines.append("## Processing Errors")
+        lines.append("")
+        for error in summary.errors:
+            lines.append(f"- {error}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def render_final_report_markdown(report: FinalHealthCheckReport) -> str:
+    lines: List[str] = [
+        f"# {report.report_title}",
+        "",
+        f"**Generated at UTC:** {format_datetime(report.generated_at_utc)}",
+        "",
+        f"**Root GCS URI:** `{report.root_gcs_uri}`",
+        "",
+    ]
+
+    if report.output_gcs_uri:
+        lines.extend([f"**Output GCS URI:** `{report.output_gcs_uri}`", ""])
+
+    if report.global_summary:
+        lines.extend(["# Global Summary", "", report.global_summary, ""])
+
+    if report.global_warnings:
+        lines.extend(["# Global Warnings", ""])
+        for warning in report.global_warnings:
+            lines.append(f"- {warning}")
+        lines.append("")
+
+    lines.append(render_processing_summary(report.processing_summary))
+
+    if not report.vm_reports:
+        lines.extend(["# VM Reports", "", "No VM reports generated.", ""])
+        return "\n".join(lines)
+
+    lines.append("# VM Reports")
+    lines.append("")
+
+    for vm_report in report.vm_reports:
+        lines.append(render_vm_output(vm_report))
+        lines.append("")
+
+    return "\n".join(lines).strip() + "\n"
+
+
+def render_final_report_text(report: FinalHealthCheckReport) -> str:
+    markdown = render_final_report_markdown(report)
+    text = markdown.replace("<br>", "\n")
+    text = text.replace("`", "")
+    text = text.replace("**", "")
+    text = text.replace("|", " ")
+    text = text.replace("---", "")
+    return text
+
+
+def render_final_report_json(report: FinalHealthCheckReport) -> str:
+    return report.model_dump_json(indent=2)
+
+
+def resolve_output_gcs_uri(
     root_gcs_uri: str,
-    vm_folders_found: int,
-    vm_results: List[VMProcessingResult],
-    max_lines_per_file: int,
-    started_at_utc: datetime,
-    completed_at_utc: datetime,
-    errors: Optional[List[str]] = None,
-) -> PipelineProcessingSummary:
-    total_actual_folders_processed = 0
-    total_files_included = 0
-    total_files_ignored = 0
-    total_files_truncated = 0
-
-    for vm_result in vm_results:
-        ingestion_result = vm_result.ingestion_result
-        total_actual_folders_processed += len(ingestion_result.folder_bundles)
-        total_files_included += ingestion_result.included_file_count
-        total_files_ignored += ingestion_result.ignored_file_count
-
-        for bundle in ingestion_result.folder_bundles:
-            for included_file in bundle.included_files:
-                if included_file.truncated:
-                    total_files_truncated += 1
-
-    status = ProcessingStatus.COMPLETED if not errors else ProcessingStatus.FAILED
-
-    return PipelineProcessingSummary(
-        root_gcs_uri=root_gcs_uri,
-        total_vm_folders_found=vm_folders_found,
-        total_vm_folders_processed=len(vm_results),
-        total_actual_folders_processed=total_actual_folders_processed,
-        total_files_included=total_files_included,
-        total_files_ignored=total_files_ignored,
-        total_files_truncated=total_files_truncated,
-        max_lines_per_file=max_lines_per_file,
-        started_at_utc=started_at_utc,
-        completed_at_utc=completed_at_utc,
-        status=status,
-        errors=errors or [],
-    )
-
-
-def run_folder_orchestration(
-    config: OrchestratorConfig,
-    folder_llm_callable: FolderLLMCallable,
-    retrieval_callable: Optional[RetrievalCallable] = None,
-    vm_consolidation_callable: Optional[VMConsolidationCallable] = None,
-    storage_client: Optional[storage.Client] = None,
-    progress_callback: ProgressCallback = None,
-) -> PipelineResult:
-    started_at_utc = datetime.now(timezone.utc)
-    retrieval_callable = retrieval_callable or default_retrieval_callable
-    vm_consolidation_callable = (
-        vm_consolidation_callable or default_vm_consolidation_callable
-    )
-    storage_client = storage_client or storage.Client()
-
-    emit_progress(
-        callback=progress_callback,
-        event_type=ProgressEventType.PIPELINE,
-        status=ProcessingStatus.STARTED,
-        message=f"Pipeline started for root path: {config.root_gcs_uri}",
-    )
-
-    gcs_path = parse_gcs_uri(config.root_gcs_uri)
-
-    emit_progress(
-        callback=progress_callback,
-        event_type=ProgressEventType.GCS_VALIDATION,
-        status=ProcessingStatus.RUNNING,
-        message=f"Validating GCS root path: {config.root_gcs_uri}",
-    )
-
-    vm_prefixes = list_vm_prefixes(
-        root_gcs_uri=config.root_gcs_uri,
-        client=storage_client,
-        progress_callback=progress_event_to_text_callback(
-            callback=progress_callback,
-            event_type=ProgressEventType.VM_DISCOVERY,
-        ),
-    )
-
-    emit_progress(
-        callback=progress_callback,
-        event_type=ProgressEventType.VM_DISCOVERY,
-        status=ProcessingStatus.COMPLETED,
-        message=f"Discovered {len(vm_prefixes)} VM folder(s).",
-        total=len(vm_prefixes),
-        details={"vm_names": [vm_name for vm_name, _ in vm_prefixes]},
-    )
-
-    vm_results: List[VMProcessingResult] = []
-    errors: List[str] = []
-
-    with ThreadPoolExecutor(max_workers=config.max_vm_workers) as executor:
-        future_to_vm = {
-            executor.submit(
-                process_vm_folder,
-                config.root_gcs_uri,
-                gcs_path.bucket_name,
-                vm_name,
-                vm_prefix,
-                storage_client,
-                retrieval_callable,
-                folder_llm_callable,
-                vm_consolidation_callable,
-                config.max_lines_per_file,
-                config.continue_on_folder_error,
-                progress_callback,
-            ): vm_name
-            for vm_name, vm_prefix in vm_prefixes
-        }
-
-        for future in as_completed(future_to_vm):
-            vm_name = future_to_vm[future]
-
-            try:
-                vm_result = future.result()
-                vm_results.append(vm_result)
-            except Exception as exc:
-                error_message = f"VM {vm_name}: processing failed: {exc}"
-                errors.append(error_message)
-
-                emit_progress(
-                    callback=progress_callback,
-                    event_type=ProgressEventType.VM_PROCESSING,
-                    status=ProcessingStatus.FAILED,
-                    message=error_message,
-                    vm_name=vm_name,
-                )
-
-                if not config.continue_on_vm_error:
-                    raise FolderOrchestrationError(error_message) from exc
-
-    vm_results.sort(key=lambda item: item.vm_name)
-
-    completed_at_utc = datetime.now(timezone.utc)
-
-    processing_summary = build_pipeline_summary(
-        root_gcs_uri=config.root_gcs_uri,
-        vm_folders_found=len(vm_prefixes),
-        vm_results=vm_results,
-        max_lines_per_file=config.max_lines_per_file,
-        started_at_utc=started_at_utc,
-        completed_at_utc=completed_at_utc,
-        errors=errors,
-    )
-
-    report = FinalHealthCheckReport(
-        root_gcs_uri=config.root_gcs_uri,
-        output_gcs_uri=config.output_gcs_uri,
-        processing_summary=processing_summary,
-        vm_reports=[vm_result.vm_output for vm_result in vm_results],
-        global_summary=(
-            f"Processed {len(vm_results)} out of {len(vm_prefixes)} discovered VM folder(s). "
-            f"Generated {sum(len(vm.vm_output.consolidated_recommendations) for vm in vm_results)} consolidated recommendation(s)."
-        ),
-        global_warnings=errors,
-    )
-
-    final_status = ProcessingStatus.COMPLETED if not errors else ProcessingStatus.FAILED
-
-    emit_progress(
-        callback=progress_callback,
-        event_type=ProgressEventType.PIPELINE,
-        status=final_status,
-        message="Pipeline completed." if not errors else "Pipeline completed with errors.",
-        details={
-            "vm_folders_found": len(vm_prefixes),
-            "vm_folders_processed": len(vm_results),
-            "errors": errors,
-        },
-    )
-
-    return PipelineResult(report=report, vm_results=vm_results)
-
-
-def run_folder_orchestration_from_gcs_path(
-    root_gcs_uri: str,
-    folder_llm_callable: FolderLLMCallable,
-    retrieval_callable: Optional[RetrievalCallable] = None,
-    vm_consolidation_callable: Optional[VMConsolidationCallable] = None,
     output_gcs_uri: Optional[str] = None,
-    max_lines_per_file: int = DEFAULT_MAX_LINES_PER_FILE,
-    max_vm_workers: int = 3,
+    filename: str = "sap_health_check_recommendations.md",
+) -> str:
+    if output_gcs_uri and output_gcs_uri.strip():
+        cleaned = output_gcs_uri.strip()
+
+        if not cleaned.startswith("gs://"):
+            raise ReportWriterError("output_gcs_uri must start with gs://")
+
+        if cleaned.endswith("/"):
+            return cleaned + filename
+
+        parsed = parse_gcs_uri(cleaned)
+        suffix = PurePosixPath(parsed.prefix).suffix.lower()
+
+        if suffix in {".md", ".txt", ".json"}:
+            return cleaned
+
+        return cleaned.rstrip("/") + "/" + filename
+
+    parsed_root = parse_gcs_uri(root_gcs_uri)
+    base_prefix = parsed_root.prefix.rstrip("/")
+
+    if base_prefix:
+        return f"gs://{parsed_root.bucket_name}/{base_prefix}/sap_hc_output/{filename}"
+
+    return f"gs://{parsed_root.bucket_name}/sap_hc_output/{filename}"
+
+
+def upload_text_to_gcs(
+    text: str,
+    output_gcs_uri: str,
+    content_type: str = "text/markdown; charset=utf-8",
+    client: Optional[storage.Client] = None,
     progress_callback: ProgressCallback = None,
-) -> PipelineResult:
-    config = OrchestratorConfig(
-        root_gcs_uri=root_gcs_uri,
-        output_gcs_uri=output_gcs_uri,
-        max_lines_per_file=max_lines_per_file,
-        max_vm_workers=max_vm_workers,
+) -> str:
+    try:
+        parsed = parse_gcs_uri(output_gcs_uri)
+    except GCSIngestionError as exc:
+        raise ReportWriterError(str(exc)) from exc
+
+    if not parsed.prefix or parsed.prefix.endswith("/"):
+        raise ReportWriterError("output_gcs_uri must point to a file, not only a folder.")
+
+    client = client or storage.Client()
+    bucket = client.bucket(parsed.bucket_name)
+    blob = bucket.blob(parsed.prefix)
+
+    emit_progress(progress_callback, f"Writing report to {output_gcs_uri}")
+
+    blob.upload_from_string(
+        data=text,
+        content_type=content_type,
     )
 
-    return run_folder_orchestration(
-        config=config,
-        folder_llm_callable=folder_llm_callable,
-        retrieval_callable=retrieval_callable,
-        vm_consolidation_callable=vm_consolidation_callable,
+    emit_progress(progress_callback, f"Report written successfully to {output_gcs_uri}")
+
+    return output_gcs_uri
+
+
+def write_markdown_report_to_gcs(
+    report: FinalHealthCheckReport,
+    output_gcs_uri: Optional[str] = None,
+    client: Optional[storage.Client] = None,
+    progress_callback: ProgressCallback = None,
+) -> str:
+    resolved_uri = resolve_output_gcs_uri(
+        root_gcs_uri=report.root_gcs_uri,
+        output_gcs_uri=output_gcs_uri or report.output_gcs_uri,
+        filename="sap_health_check_recommendations.md",
+    )
+
+    report.output_gcs_uri = resolved_uri
+    markdown = render_final_report_markdown(report)
+
+    return upload_text_to_gcs(
+        text=markdown,
+        output_gcs_uri=resolved_uri,
+        content_type="text/markdown; charset=utf-8",
+        client=client,
         progress_callback=progress_callback,
     )
+
+
+def write_text_report_to_gcs(
+    report: FinalHealthCheckReport,
+    output_gcs_uri: Optional[str] = None,
+    client: Optional[storage.Client] = None,
+    progress_callback: ProgressCallback = None,
+) -> str:
+    resolved_uri = resolve_output_gcs_uri(
+        root_gcs_uri=report.root_gcs_uri,
+        output_gcs_uri=output_gcs_uri or report.output_gcs_uri,
+        filename="sap_health_check_recommendations.txt",
+    )
+
+    report.output_gcs_uri = resolved_uri
+    text = render_final_report_text(report)
+
+    return upload_text_to_gcs(
+        text=text,
+        output_gcs_uri=resolved_uri,
+        content_type="text/plain; charset=utf-8",
+        client=client,
+        progress_callback=progress_callback,
+    )
+
+
+def write_json_report_to_gcs(
+    report: FinalHealthCheckReport,
+    output_gcs_uri: Optional[str] = None,
+    client: Optional[storage.Client] = None,
+    progress_callback: ProgressCallback = None,
+) -> str:
+    resolved_uri = resolve_output_gcs_uri(
+        root_gcs_uri=report.root_gcs_uri,
+        output_gcs_uri=output_gcs_uri or report.output_gcs_uri,
+        filename="sap_health_check_recommendations.json",
+    )
+
+    report.output_gcs_uri = resolved_uri
+    json_text = render_final_report_json(report)
+
+    return upload_text_to_gcs(
+        text=json_text,
+        output_gcs_uri=resolved_uri,
+        content_type="application/json; charset=utf-8",
+        client=client,
+        progress_callback=progress_callback,
+    )
+
+
+def write_report_to_gcs(
+    report: FinalHealthCheckReport,
+    output_gcs_uri: Optional[str] = None,
+    report_format: str = "md",
+    client: Optional[storage.Client] = None,
+    progress_callback: ProgressCallback = None,
+) -> str:
+    normalized_format = report_format.strip().lower()
+
+    if normalized_format in {"md", "markdown"}:
+        return write_markdown_report_to_gcs(
+            report=report,
+            output_gcs_uri=output_gcs_uri,
+            client=client,
+            progress_callback=progress_callback,
+        )
+
+    if normalized_format in {"txt", "text"}:
+        return write_text_report_to_gcs(
+            report=report,
+            output_gcs_uri=output_gcs_uri,
+            client=client,
+            progress_callback=progress_callback,
+        )
+
+    if normalized_format == "json":
+        return write_json_report_to_gcs(
+            report=report,
+            output_gcs_uri=output_gcs_uri,
+            client=client,
+            progress_callback=progress_callback,
+        )
+
+    raise ReportWriterError(
+        f"Unsupported report format: {report_format}. Supported formats: md, txt, json."
+    )
+
+
+def write_report_to_local_file(
+    report: FinalHealthCheckReport,
+    local_path: str,
+    report_format: str = "md",
+) -> str:
+    normalized_format = report_format.strip().lower()
+
+    if normalized_format in {"md", "markdown"}:
+        content = render_final_report_markdown(report)
+    elif normalized_format in {"txt", "text"}:
+        content = render_final_report_text(report)
+    elif normalized_format == "json":
+        content = render_final_report_json(report)
+    else:
+        raise ReportWriterError(
+            f"Unsupported report format: {report_format}. Supported formats: md, txt, json."
+        )
+
+    directory = os.path.dirname(local_path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    with open(local_path, "w", encoding="utf-8") as file_obj:
+        file_obj.write(content)
+
+    return local_path
