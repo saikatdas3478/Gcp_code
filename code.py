@@ -1,143 +1,142 @@
-python - <<'PY'
+from __future__ import annotations
+
+import json
 import os
-from dotenv import load_dotenv
+from typing import Any, AsyncGenerator
 
-load_dotenv()
+import uvicorn
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
 
-keys = [
-    "GOOGLE_CLOUD_PROJECT",
-    "GOOGLE_CLOUD_LOCATION",
-    "ROOT_AGENT_MODEL",
-    "CORPUS_ID_SAP_RULE_BOOK",
-    "CORPUS_ID_SAP_PREVIOUS_REPS",
-    "CORPUS_ID_SAP_NOTES_CHECK",
-    "SAP_HC_ENABLE_GOOGLE_FIRST",
-    "SAP_HC_ENABLE_SECTION_LINK_LOOKUP",
-    "SAP_HC_ENABLE_SAP_NOTE_REDIRECT",
-    "SAP_HC_ENABLE_PREVIOUS_REPORT_CROSS_CHECK",
-]
+from .orchestrator import run_health_check_stream
+from .schemas import HealthCheckRequest
 
-for key in keys:
-    print(key, "=", os.environ.get(key))
-PY
 
-uv run python -c "from sap_hc_agent.gcs_ingestion import ingest_gcs_root; r=ingest_gcs_root('gs://sap-hc-agent/test_data/', progress_callback=print); print('VM count:', len(r)); print('VM names:', [x.vm_name for x in r])"
-
-uv run python -c "from sap_hc_agent.gcs_ingestion import ingest_gcs_root; r=ingest_gcs_root('gs://sap-hc-agent/test_data/', progress_callback=print); print('VM count:', len(r)); print('VM names:', [x.vm_name for x in r])"
-
-uv run python - <<'PY'
-from sap_hc_agent.gcs_ingestion import ingest_gcs_root, flatten_folder_bundles
-from sap_hc_agent.retrieval_service import (
-    detect_rulebook_sections,
-    get_section_reference_urls,
-    get_section_sap_notes,
+app = FastAPI(
+    title="SAP HANA Health Check Service",
+    version="1.0.0",
 )
 
-results = ingest_gcs_root("gs://sap-hc-agent/test_data/", progress_callback=print)
-bundles = flatten_folder_bundles(results)
-
-print("\nTotal folder bundles:", len(bundles))
-
-for bundle in bundles:
-    sections = detect_rulebook_sections(bundle)
-    urls = get_section_reference_urls(sections)
-    notes = get_section_sap_notes(sections)
-
-    print("\nVM:", bundle.vm_name)
-    print("Folder:", bundle.folder_relative_path)
-    print("Detected sections:", sections)
-    print("Section URLs:", urls)
-    print("Section SAP Notes:", notes)
-PY
-
-uv run python - <<'PY'
-from sap_hc_agent.gcs_ingestion import ingest_gcs_root, flatten_folder_bundles
-from sap_hc_agent.retrieval_service import (
-    create_retrieval_callable,
-    detect_rulebook_sections,
-    get_section_reference_urls,
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-results = ingest_gcs_root("gs://sap-hc-agent/test_data/", progress_callback=print)
-bundles = flatten_folder_bundles(results)
 
-for bundle in bundles:
-    sections = detect_rulebook_sections(bundle)
-    urls = get_section_reference_urls(sections)
+def _json_default(value: Any) -> str:
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
 
-    if urls:
-        print("\nTesting bundle:")
-        print("VM:", bundle.vm_name)
-        print("Folder:", bundle.folder_relative_path)
-        print("Sections:", sections)
-        print("URLs:", urls)
 
-        ctx = create_retrieval_callable()(bundle)
+def _format_sse(event_name: str, data: Any) -> str:
+    payload = json.dumps(data, default=_json_default, ensure_ascii=False)
+    return f"event: {event_name}\ndata: {payload}\n\n"
 
-        print("Google hits:", len(ctx.google_search_hits))
-        print("SAP Notes hits:", len(ctx.sap_notes_hits))
-        print("Rule Book hits:", len(ctx.gcp_rule_book_hits))
-        print("Previous Report hits:", len(ctx.previous_report_hits))
 
-        if ctx.google_search_hits:
-            print("\nFirst Google hit:")
-            print("Source:", ctx.google_search_hits[0].source_uri)
-            print("Text:", ctx.google_search_hits[0].text[:1000])
-        else:
-            print("No Google enrichment found.")
+def _normalize_event(raw_event: Any) -> tuple[str, Any]:
+    if isinstance(raw_event, dict):
+        event_name = (
+            raw_event.get("event")
+            or raw_event.get("event_name")
+            or raw_event.get("type")
+            or "pipeline_update"
+        )
+        data = raw_event.get("data", raw_event)
+        return str(event_name), data
 
-        break
-PY
+    event_name = (
+        getattr(raw_event, "event_name", None)
+        or getattr(raw_event, "event", None)
+        or getattr(raw_event, "type", None)
+        or "pipeline_update"
+    )
 
-uv run python - <<'PY'
-from sap_hc_agent.gcs_ingestion import ingest_gcs_root, flatten_folder_bundles
-from sap_hc_agent.retrieval_service import create_retrieval_callable, detect_rulebook_sections
+    if hasattr(raw_event, "model_dump"):
+        data = raw_event.model_dump()
+    elif hasattr(raw_event, "__dict__"):
+        data = vars(raw_event)
+    else:
+        data = {"message": str(raw_event)}
 
-results = ingest_gcs_root("gs://sap-hc-agent/test_data/", progress_callback=print)
-bundles = flatten_folder_bundles(results)
+    return str(event_name), data
 
-for bundle in bundles:
-    sections = detect_rulebook_sections(bundle)
 
-    if "database_version_sp_level" in sections or "machine_types_certification" in sections:
-        print("\nTesting SAP Note redirect")
-        print("VM:", bundle.vm_name)
-        print("Folder:", bundle.folder_relative_path)
-        print("Sections:", sections)
+@app.get("/")
+async def root() -> dict[str, str]:
+    return {
+        "service": "SAP HANA Health Check Service",
+        "status": "running",
+    }
 
-        ctx = create_retrieval_callable()(bundle)
 
-        sap_note_queries = [
-            q for q in ctx.search_queries_used
-            if "SAP Note" in q
-        ]
+@app.get("/health")
+async def health() -> dict[str, str]:
+    return {"status": "healthy"}
 
-        print("SAP Note queries:")
-        for q in sap_note_queries:
-            print("-", q)
 
-        print("SAP Notes hits:", len(ctx.sap_notes_hits))
+@app.post("/sap-health-check/stream")
+async def sap_health_check_stream(
+    payload: HealthCheckRequest,
+    request: Request,
+) -> StreamingResponse:
+    async def event_generator() -> AsyncGenerator[str, None]:
+        try:
+            yield _format_sse(
+                "request_received",
+                {
+                    "message": "SAP Health Check request received.",
+                    "gcs_bucket_path": payload.gcs_bucket_path,
+                    "max_parallel_vms": payload.max_parallel_vms or 3,
+                },
+            )
 
-        if ctx.sap_notes_hits:
-            print("First SAP Note hit:")
-            print(ctx.sap_notes_hits[0].text[:800])
+            async for raw_event in run_health_check_stream(payload):
+                if await request.is_disconnected():
+                    break
 
-        break
-PY
+                event_name, data = _normalize_event(raw_event)
+                yield _format_sse(event_name, data)
 
-uv run python - <<'PY'
-from sap_hc_agent.gcs_ingestion import ingest_gcs_root, flatten_folder_bundles
-from sap_hc_agent.retrieval_service import create_retrieval_callable
+        except Exception as exc:
+            yield _format_sse(
+                "pipeline_failed",
+                {
+                    "status": "failed",
+                    "message": str(exc),
+                },
+            )
 
-results = ingest_gcs_root("gs://sap-hc-agent/test_data/", progress_callback=print)
-bundle = flatten_folder_bundles(results)[0]
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
-ctx = create_retrieval_callable()(bundle)
 
-print("Previous report hits:", len(ctx.previous_report_hits))
+@app.exception_handler(Exception)
+async def global_exception_handler(_: Request, exc: Exception) -> JSONResponse:
+    return JSONResponse(
+        status_code=500,
+        content={
+            "status": "failed",
+            "message": str(exc),
+        },
+    )
 
-for hit in ctx.previous_report_hits[:3]:
-    print("\nSource:", hit.source_uri)
-    print("Query:", hit.query)
-    print("Text:", hit.text[:500])
-PY
+
+if __name__ == "__main__":
+    uvicorn.run(
+        "sap_hc_agent.main:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8080")),
+        reload=os.getenv("ENV", "").lower() == "local",
+    )
