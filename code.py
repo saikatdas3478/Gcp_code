@@ -1,530 +1,236 @@
 from __future__ import annotations
 
-from pathlib import PurePosixPath
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
-from google.cloud import storage
+def return_description() -> str:
+    return """
+You are a highly specialized SAP HANA Health Check Assistant.
 
-from .file_filters import should_include_file
-from .schemas import FolderContext, GCSPath, IgnoredFile, SourceFile, TextChunk, VMContext
+The user provides a GCS root folder path and dynamic corpus IDs.
+The service processes VM folders and log/configuration files from GCS, performs retrieval from SAP Rule Book, SAP Notes, previous assessment reports, and related Google documentation, then generates SAP HANA health check recommendations.
+
+The final recommendation style must remain exactly like the previously approved SAP Health Check report style:
+- Individual Parameter Recommendations table
+- Combined Pattern Recommendations table
+- Compliance & Checklist Report table
 
+Do not ask the user to manually upload files.
+Do not change the approved report style.
+Do not invent facts, values, citations, SAP Note numbers, GCP rule IDs, or file names.
+"""
 
-ProgressCallback = Optional[Callable[[str], None]]
 
-DEFAULT_MAX_LINES_PER_FILE = 1000
-DEFAULT_CHUNK_MAX_CHARS = 4000
-DEFAULT_CHUNK_OVERLAP_CHARS = 400
+def return_folder_recommendation_prompt(
+    folder_context_json: str,
+    retrieval_context_json: str,
+) -> str:
+    return f"""
+You are a highly specialized SAP HANA Health Check Assistant and provide recommendations based on the provided VM folder logs/configuration data.
 
+Your purpose is to deliver expert, in-depth health check recommendations for SAP HANA systems.
+You achieve this by analyzing folder-level VM data, identifying individual parameter issues and combined parameter patterns, and generating actionable, evidence-based advice to optimize performance, security, stability, and compliance.
 
-class GCSIngestionError(Exception):
-    pass
+You must keep the recommendation output style exactly like the previously approved SAP Health Check report style.
 
+Strict rules:
+- Return Markdown only.
+- Do not return JSON.
+- Do not return code blocks.
+- Do not invent parameter values, file names, line numbers, SAP Note numbers, GCP rule IDs, URLs, or citations.
+- Use current observed values only from the provided VM folder logs/config files.
+- Use SAP Rule Book RAG and SAP Notes RAG as recommendation evidence.
+- Use Google documentation context only when it is provided and relevant.
+- Use previous assessment reports only as style and recommendation-pattern guidance.
+- Never use previous assessment report values as current observed values.
+- If previous reports contain old values, ignore those values.
+- If evidence is insufficient, mention "Not Checked" or "Not Applicable" instead of guessing.
+- Every recommendation must include observed value/fact/number wherever available.
+- Reasoning must be short, crisp, and evidence-backed.
+- Keep citations concise.
+- If there are no findings for a section, write "No recommendation issued based on the available evidence."
 
-def emit_progress(callback: ProgressCallback, message: str) -> None:
-    if callback:
-        callback(message)
+Folder context JSON:
+{folder_context_json}
 
+Retrieval context JSON:
+{retrieval_context_json}
 
-def parse_gcs_uri(gcs_uri: str) -> GCSPath:
-    if not gcs_uri or not gcs_uri.strip().startswith("gs://"):
-        raise GCSIngestionError("GCS path must start with gs://")
+Generate the folder-level recommendation in exactly this Markdown format:
 
-    raw_path = gcs_uri.strip().replace("gs://", "", 1)
+Hello, I have completed the comprehensive analysis of the provided VM folder data.
 
-    if not raw_path:
-        raise GCSIngestionError("GCS path must include a bucket name")
+VM Name:
+Folder Name:
 
-    parts = raw_path.split("/", 1)
-    bucket_name = parts[0].strip()
+Individual Parameter Recommendations in below table format:
 
-    if not bucket_name:
-        raise GCSIngestionError("GCS bucket name is empty")
+| Original Parameter | Recommendation | Reasoning & Justification | Citations |
+|---|---|---|---|
+| parameter_name = observed_value | crisp recommendation | 2-4 line evidence-backed reason explaining why this recommendation is needed | input file / SAP Note / GCP Rule Book / Google documentation reference |
 
-    prefix = ""
+Combined Pattern Recommendations in below table format:
 
-    if len(parts) > 1:
-        prefix = parts[1].strip("/")
+| Original Parameters | Recommendation | Reasoning & Justification | Citations |
+|---|---|---|---|
+| parameter_1 = observed_value, parameter_2 = observed_value | crisp combined recommendation | 2-4 line explanation of the relationship between the observed parameters and why the recommendation is needed | input file / SAP Note / GCP Rule Book / Google documentation reference |
 
-    if prefix:
-        prefix = f"{prefix}/"
+Compliance & Checklist Report in below table format:
 
-    return GCSPath(bucket_name=bucket_name, prefix=prefix)
+| Rule / Check | Parameter Found | Observed Value | Expected Value | Status | Reasoning | Citations |
+|---|---|---|---|---|---|---|
+| rule or check name | Yes/No | observed value or N/A | expected value or N/A | Compliant / Recommendation Issued / Not Applicable / Not Checked | short reason | input file / SAP Note / GCP Rule Book / Google documentation reference |
 
+I hope these recommendations are helpful. Please let me know if you have any questions or require further clarification on any of these points.
+""".strip()
 
-def get_storage_client(project_id: Optional[str] = None) -> storage.Client:
-    return storage.Client(project=project_id)
 
+def return_folder_analysis_prompt(folder_input_json: str) -> str:
+    return f"""
+You are a highly specialized SAP HANA Health Check Assistant and provide recommendations based on the provided VM folder logs/configuration data.
 
-def blob_to_gcs_uri(bucket_name: str, blob_name: str) -> str:
-    return f"gs://{bucket_name}/{blob_name}"
+Your purpose is to deliver expert, in-depth health check recommendations for SAP HANA systems.
+You achieve this by analyzing folder-level VM data, identifying individual parameter issues and combined parameter patterns, and generating actionable, evidence-based advice to optimize performance, security, stability, and compliance.
 
+You must keep the recommendation output style exactly like the previously approved SAP Health Check report style.
 
-def normalize_blob_name(blob_name: str) -> str:
-    return str(PurePosixPath(blob_name))
+Strict rules:
+- Return Markdown only.
+- Do not return JSON.
+- Do not return code blocks.
+- Do not invent parameter values, file names, line numbers, SAP Note numbers, GCP rule IDs, URLs, or citations.
+- Use current observed values only from the provided VM folder logs/config files.
+- Use SAP Rule Book RAG and SAP Notes RAG as recommendation evidence.
+- Use Google documentation context only when it is provided and relevant.
+- Use previous assessment reports only as style and recommendation-pattern guidance.
+- Never use previous assessment report values as current observed values.
+- If evidence is insufficient, mention "Not Checked" or "Not Applicable" instead of guessing.
+- Every recommendation must include observed value/fact/number wherever available.
+- Reasoning must be short, crisp, and evidence-backed.
+- Keep citations concise.
+- If there are no findings for a section, write "No recommendation issued based on the available evidence."
 
+Folder input JSON:
+{folder_input_json}
 
-def is_directory_marker(blob_name: str) -> bool:
-    return blob_name.endswith("/")
+Generate the folder-level recommendation in exactly this Markdown format:
 
+Hello, I have completed the comprehensive analysis of the provided VM folder data.
 
-def get_relative_path(blob_name: str, base_prefix: str) -> str:
-    if blob_name.startswith(base_prefix):
-        return blob_name[len(base_prefix) :].lstrip("/")
-    return blob_name
+VM Name:
+Folder Name:
 
+Individual Parameter Recommendations in below table format:
 
-def get_folder_relative_path(relative_file_path: str) -> str:
-    parent = str(PurePosixPath(relative_file_path).parent)
-    return "." if parent == "." else parent
+| Original Parameter | Recommendation | Reasoning & Justification | Citations |
+|---|---|---|---|
+| parameter_name = observed_value | crisp recommendation | 2-4 line evidence-backed reason explaining why this recommendation is needed | input file / SAP Note / GCP Rule Book / Google documentation reference |
 
+Combined Pattern Recommendations in below table format:
 
-def build_folder_gcs_prefix(vm_prefix: str, folder_name: str) -> str:
-    if folder_name == ".":
-        return vm_prefix.rstrip("/") + "/"
+| Original Parameters | Recommendation | Reasoning & Justification | Citations |
+|---|---|---|---|
+| parameter_1 = observed_value, parameter_2 = observed_value | crisp combined recommendation | 2-4 line explanation of the relationship between the observed parameters and why the recommendation is needed | input file / SAP Note / GCP Rule Book / Google documentation reference |
 
-    return str(PurePosixPath(vm_prefix) / folder_name).rstrip("/") + "/"
+Compliance & Checklist Report in below table format:
 
+| Rule / Check | Parameter Found | Observed Value | Expected Value | Status | Reasoning | Citations |
+|---|---|---|---|---|---|---|
+| rule or check name | Yes/No | observed value or N/A | expected value or N/A | Compliant / Recommendation Issued / Not Applicable / Not Checked | short reason | input file / SAP Note / GCP Rule Book / Google documentation reference |
 
-def validate_gcs_root_path(
-    gcs_bucket_path: str,
-    client: Optional[storage.Client] = None,
-    progress_callback: ProgressCallback = None,
-) -> GCSPath:
-    gcs_path = parse_gcs_uri(gcs_bucket_path)
-    client = client or get_storage_client()
+I hope these recommendations are helpful. Please let me know if you have any questions or require further clarification on any of these points.
+""".strip()
 
-    emit_progress(progress_callback, f"Validating GCS path {gcs_path.uri}")
 
-    bucket = client.bucket(gcs_path.bucket_name)
+def return_vm_consolidation_prompt(vm_input_json: str) -> str:
+    return f"""
+You are a highly specialized SAP HANA Health Check consolidation analyst.
 
-    if not bucket.exists():
-        raise GCSIngestionError(f"GCS bucket does not exist: {gcs_path.bucket_name}")
+You will receive all folder-level SAP Health Check recommendation outputs for one VM.
 
-    blobs = list(
-        client.list_blobs(
-            bucket_or_name=bucket,
-            prefix=gcs_path.prefix,
-            max_results=1,
-        )
-    )
+Your task:
+1. Merge duplicate or overlapping recommendations.
+2. Keep the strongest and most evidence-backed recommendation.
+3. Preserve current observed values, numbers, parameters, file references, SAP Notes, GCP rule references, and Google documentation references wherever available.
+4. Keep the final VM-level output style exactly like the previously approved SAP Health Check report style.
+5. Do not return JSON.
+6. Do not return code blocks.
+7. Do not invent facts, values, SAP Notes, GCP rules, URLs, file names, or citations.
+8. Use previous assessment report references only as style guidance, never as current VM evidence.
+9. If evidence is weak or unavailable, mark the checklist item as "Not Checked" or "Not Applicable".
 
-    if not blobs:
-        raise GCSIngestionError(f"No files or folders found under {gcs_path.uri}")
+VM consolidation input JSON:
+{vm_input_json}
 
-    emit_progress(progress_callback, f"Validated GCS path {gcs_path.uri}")
+Generate the consolidated VM-level recommendation in exactly this Markdown format:
 
-    return gcs_path
-
+Hello, I have completed the comprehensive analysis of your VM parameter data.
+Here are my findings, separated into individual and combined recommendations.
 
-def list_vm_prefixes(
-    gcs_bucket_path: str,
-    client: Optional[storage.Client] = None,
-    progress_callback: ProgressCallback = None,
-) -> List[Tuple[str, str]]:
-    gcs_path = parse_gcs_uri(gcs_bucket_path)
-    client = client or get_storage_client()
-    bucket = client.bucket(gcs_path.bucket_name)
+VM Name:
 
-    emit_progress(progress_callback, f"Discovering VM folders under {gcs_path.uri}")
+Individual Parameter Recommendations in below table format:
 
-    blobs_iter = client.list_blobs(
-        bucket_or_name=bucket,
-        prefix=gcs_path.prefix,
-        delimiter="/",
-    )
+| Original Parameter | Recommendation | Reasoning & Justification | Citations |
+|---|---|---|---|
+| parameter_name = observed_value | crisp recommendation | 2-4 line evidence-backed reason explaining why this recommendation is needed | input file / SAP Note / GCP Rule Book / Google documentation reference |
 
-    root_files = []
+Combined Pattern Recommendations in below table format:
 
-    for blob in blobs_iter:
-        if not is_directory_marker(blob.name):
-            root_files.append(blob.name)
+| Original Parameters | Recommendation | Reasoning & Justification | Citations |
+|---|---|---|---|
+| parameter_1 = observed_value, parameter_2 = observed_value | crisp combined recommendation | 2-4 line explanation of the relationship between the observed parameters and why the recommendation is needed | input file / SAP Note / GCP Rule Book / Google documentation reference |
 
-    vm_prefixes = sorted(blobs_iter.prefixes)
+Compliance & Checklist Report in below table format:
 
-    if root_files:
-        vm_prefixes.append(gcs_path.prefix)
+| Rule / Check | Parameter Found | Observed Value | Expected Value | Status | Reasoning | Citations |
+|---|---|---|---|---|---|---|
+| rule or check name | Yes/No | observed value or N/A | expected value or N/A | Compliant / Recommendation Issued / Not Applicable / Not Checked | short reason | input file / SAP Note / GCP Rule Book / Google documentation reference |
 
-    vm_results: List[Tuple[str, str]] = []
+I hope these recommendations are helpful. Please let me know if you have any questions or require further clarification on any of these points.
+""".strip()
 
-    for vm_prefix in vm_prefixes:
-        normalized_prefix = vm_prefix.rstrip("/") + "/"
 
-        if normalized_prefix == gcs_path.prefix:
-            vm_name = PurePosixPath(gcs_path.prefix.rstrip("/")).name or "root"
-        else:
-            vm_name = normalized_prefix.rstrip("/").split("/")[-1]
+def return_final_report_header_prompt() -> str:
+    return """
+# SAP HANA Health Check Recommendation Report
 
-        vm_results.append((vm_name, normalized_prefix))
+This report contains VM-wise SAP HANA health check recommendations generated from the provided GCS input path.
 
-    deduped: Dict[str, str] = {}
+The recommendation format follows the previously approved SAP Health Check report style.
+""".strip()
 
-    for vm_name, vm_prefix in vm_results:
-        deduped[vm_prefix] = vm_name
 
-    final_results = [(vm_name, vm_prefix) for vm_prefix, vm_name in deduped.items()]
-    final_results.sort(key=lambda item: item[0].lower())
-
-    if not final_results:
-        raise GCSIngestionError(f"No VM folders found under {gcs_path.uri}")
-
-    emit_progress(
-        progress_callback,
-        f"Discovered {len(final_results)} VM folder(s) under {gcs_path.uri}",
-    )
+def return_previous_report_usage_rule() -> str:
+    return """
+Previous assessment reports are outdated examples.
+Use them only to understand recommendation style, phrasing, report structure, and common recommendation patterns.
+Never use previous report values as current observed values.
+Current observed values must come only from the uploaded VM logs/configuration files.
+""".strip()
 
-    return final_results
 
+def return_markdown_contract() -> str:
+    return """
+The output must be Markdown only.
 
-def read_first_n_lines_from_blob(
-    blob: storage.Blob,
-    max_lines: int = DEFAULT_MAX_LINES_PER_FILE,
-    encoding: str = "utf-8",
-) -> Tuple[str, int, bool]:
-    lines: List[str] = []
-    truncated = False
+Required sections:
+1. Individual Parameter Recommendations
+2. Combined Pattern Recommendations
+3. Compliance & Checklist Report
 
-    try:
-        with blob.open("rt", encoding=encoding, errors="replace") as file_obj:
-            for line_number, line in enumerate(file_obj, start=1):
-                if line_number > max_lines:
-                    truncated = True
-                    break
-                lines.append(line)
-    except Exception as exc:
-        raise GCSIngestionError(
-            f"Failed to read gs://{blob.bucket.name}/{blob.name}: {exc}"
-        ) from exc
-
-    return "".join(lines), len(lines), truncated
-
-
-def build_file_section(source_file: SourceFile) -> str:
-    truncated = "Yes" if source_file.truncated else "No"
-    content = source_file.content or ""
-
-    return "\n".join(
-        [
-            f"===== FILE START: {source_file.gcs_uri} =====",
-            f"Relative path: {source_file.relative_path}",
-            f"Folder: {source_file.folder_relative_path}",
-            f"Lines included: 1-{source_file.lines_read}",
-            f"Truncated after configured line limit: {truncated}",
-            "",
-            content,
-            f"===== FILE END: {source_file.gcs_uri} =====",
-        ]
-    )
-
-
-def build_combined_text(source_files: Iterable[SourceFile]) -> str:
-    return "\n\n".join(build_file_section(source_file) for source_file in source_files)
-
-
-def split_text_with_line_ranges(
-    text: str,
-    max_chars: int = DEFAULT_CHUNK_MAX_CHARS,
-    overlap_chars: int = DEFAULT_CHUNK_OVERLAP_CHARS,
-) -> List[Tuple[str, str]]:
-    if not text:
-        return []
-
-    lines = text.splitlines()
-    chunks: List[Tuple[str, str]] = []
-
-    current_lines: List[str] = []
-    current_start_line = 1
-    current_chars = 0
-
-    for index, line in enumerate(lines, start=1):
-        line_with_newline = line + "\n"
-        line_len = len(line_with_newline)
-
-        if current_lines and current_chars + line_len > max_chars:
-            end_line = index - 1
-            chunk_text = "".join(current_lines).strip()
-
-            if chunk_text:
-                chunks.append((chunk_text, f"{current_start_line}-{end_line}"))
-
-            if overlap_chars > 0:
-                overlap_lines: List[str] = []
-                overlap_size = 0
-
-                for previous_line in reversed(current_lines):
-                    if overlap_size + len(previous_line) > overlap_chars:
-                        break
-                    overlap_lines.insert(0, previous_line)
-                    overlap_size += len(previous_line)
-
-                current_lines = overlap_lines
-                current_start_line = max(1, end_line - len(current_lines) + 1)
-                current_chars = sum(len(item) for item in current_lines)
-            else:
-                current_lines = []
-                current_start_line = index
-                current_chars = 0
-
-        if not current_lines:
-            current_start_line = index
-
-        current_lines.append(line_with_newline)
-        current_chars += line_len
-
-    if current_lines:
-        chunk_text = "".join(current_lines).strip()
-
-        if chunk_text:
-            chunks.append((chunk_text, f"{current_start_line}-{len(lines)}"))
-
-    return chunks
-
-
-def build_chunks_for_source_file(
-    vm_name: str,
-    folder_name: str,
-    source_file: SourceFile,
-    max_chars: int = DEFAULT_CHUNK_MAX_CHARS,
-    overlap_chars: int = DEFAULT_CHUNK_OVERLAP_CHARS,
-) -> List[TextChunk]:
-    chunks: List[TextChunk] = []
-
-    for index, (chunk_text, line_range) in enumerate(
-        split_text_with_line_ranges(
-            source_file.content or "",
-            max_chars=max_chars,
-            overlap_chars=overlap_chars,
-        ),
-        start=1,
-    ):
-        chunks.append(
-            TextChunk(
-                chunk_id=f"{vm_name}/{folder_name}/{source_file.relative_path}/chunk-{index}",
-                vm_name=vm_name,
-                folder_name=folder_name,
-                source_uri=source_file.gcs_uri,
-                relative_path=source_file.relative_path,
-                line_range=line_range,
-                text=chunk_text,
-                metadata={
-                    "filename": source_file.filename,
-                    "folder_relative_path": source_file.folder_relative_path,
-                    "lines_read": source_file.lines_read,
-                    "truncated": source_file.truncated,
-                },
-            )
-        )
-
-    return chunks
-
-
-def build_chunks_for_folder(
-    folder_context: FolderContext,
-    max_chars: int = DEFAULT_CHUNK_MAX_CHARS,
-    overlap_chars: int = DEFAULT_CHUNK_OVERLAP_CHARS,
-) -> List[TextChunk]:
-    chunks: List[TextChunk] = []
-
-    for source_file in folder_context.included_files:
-        chunks.extend(
-            build_chunks_for_source_file(
-                vm_name=folder_context.vm_name,
-                folder_name=folder_context.folder_name,
-                source_file=source_file,
-                max_chars=max_chars,
-                overlap_chars=overlap_chars,
-            )
-        )
-
-    return chunks
-
-
-def ingest_vm_folder(
-    bucket_name: str,
-    vm_name: str,
-    vm_prefix: str,
-    client: Optional[storage.Client] = None,
-    max_lines_per_file: int = DEFAULT_MAX_LINES_PER_FILE,
-    chunk_max_chars: int = DEFAULT_CHUNK_MAX_CHARS,
-    chunk_overlap_chars: int = DEFAULT_CHUNK_OVERLAP_CHARS,
-    progress_callback: ProgressCallback = None,
-) -> VMContext:
-    client = client or get_storage_client()
-    bucket = client.bucket(bucket_name)
-
-    emit_progress(progress_callback, f"{vm_name}: scanning files under gs://{bucket_name}/{vm_prefix}")
-
-    blobs = list(client.list_blobs(bucket_or_name=bucket, prefix=vm_prefix))
-
-    folder_files: Dict[str, List[SourceFile]] = {}
-    folder_ignored: Dict[str, List[IgnoredFile]] = {}
-    vm_ignored: List[IgnoredFile] = []
-
-    total_files = 0
-
-    for blob in blobs:
-        blob_name = normalize_blob_name(blob.name)
-
-        if is_directory_marker(blob_name):
-            continue
-
-        total_files += 1
-
-        relative_path = get_relative_path(blob_name, vm_prefix)
-
-        if not relative_path:
-            continue
-
-        filename = PurePosixPath(relative_path).name
-        folder_name = get_folder_relative_path(relative_path)
-        gcs_uri = blob_to_gcs_uri(bucket_name, blob_name)
-
-        include, reason = should_include_file(
-            filename=filename,
-            folder_relative_path=folder_name,
-        )
-
-        if not include:
-            ignored_file = IgnoredFile(
-                gcs_uri=gcs_uri,
-                relative_path=relative_path,
-                reason=reason,
-            )
-
-            folder_ignored.setdefault(folder_name, []).append(ignored_file)
-            vm_ignored.append(ignored_file)
-            continue
-
-        content, lines_read, truncated = read_first_n_lines_from_blob(
-            blob=blob,
-            max_lines=max_lines_per_file,
-        )
-
-        source_file = SourceFile(
-            gcs_uri=gcs_uri,
-            relative_path=relative_path,
-            folder_relative_path=folder_name,
-            filename=filename,
-            lines_read=lines_read,
-            truncated=truncated,
-            content=content,
-        )
-
-        folder_files.setdefault(folder_name, []).append(source_file)
-
-    folder_contexts: List[FolderContext] = []
-
-    for folder_name in sorted(folder_files.keys()):
-        source_files = sorted(
-            folder_files[folder_name],
-            key=lambda item: item.relative_path.lower(),
-        )
-
-        folder_context = FolderContext(
-            vm_name=vm_name,
-            folder_name=folder_name,
-            folder_gcs_prefix=build_folder_gcs_prefix(vm_prefix, folder_name),
-            included_files=source_files,
-            ignored_files=folder_ignored.get(folder_name, []),
-            chunks=[],
-            combined_text=build_combined_text(source_files),
-            truncated_file_count=sum(1 for item in source_files if item.truncated),
-        )
-
-        folder_context.chunks = build_chunks_for_folder(
-            folder_context,
-            max_chars=chunk_max_chars,
-            overlap_chars=chunk_overlap_chars,
-        )
-
-        folder_contexts.append(folder_context)
-
-    vm_context = VMContext(
-        vm_name=vm_name,
-        vm_gcs_prefix=vm_prefix,
-        folders=folder_contexts,
-        ignored_files=vm_ignored,
-    )
-
-    emit_progress(
-        progress_callback,
-        (
-            f"{vm_name}: scan completed. "
-            f"Total files found: {total_files}. "
-            f"Included files: {vm_context.included_file_count}. "
-            f"Ignored files: {vm_context.ignored_file_count}. "
-            f"Folders with included files: {vm_context.folder_count}. "
-            f"Truncated files: {vm_context.truncated_file_count}."
-        ),
-    )
-
-    return vm_context
-
-
-def ingest_gcs_root(
-    gcs_bucket_path: str,
-    client: Optional[storage.Client] = None,
-    max_lines_per_file: int = DEFAULT_MAX_LINES_PER_FILE,
-    chunk_max_chars: int = DEFAULT_CHUNK_MAX_CHARS,
-    chunk_overlap_chars: int = DEFAULT_CHUNK_OVERLAP_CHARS,
-    progress_callback: ProgressCallback = None,
-) -> List[VMContext]:
-    client = client or get_storage_client()
-    gcs_path = validate_gcs_root_path(
-        gcs_bucket_path,
-        client=client,
-        progress_callback=progress_callback,
-    )
-
-    vm_prefixes = list_vm_prefixes(
-        gcs_bucket_path,
-        client=client,
-        progress_callback=progress_callback,
-    )
-
-    vm_contexts: List[VMContext] = []
-
-    for index, (vm_name, vm_prefix) in enumerate(vm_prefixes, start=1):
-        emit_progress(
-            progress_callback,
-            f"Processing VM {index}/{len(vm_prefixes)}: {vm_name}",
-        )
-
-        vm_contexts.append(
-            ingest_vm_folder(
-                bucket_name=gcs_path.bucket_name,
-                vm_name=vm_name,
-                vm_prefix=vm_prefix,
-                client=client,
-                max_lines_per_file=max_lines_per_file,
-                chunk_max_chars=chunk_max_chars,
-                chunk_overlap_chars=chunk_overlap_chars,
-                progress_callback=progress_callback,
-            )
-        )
-
-    emit_progress(progress_callback, f"Ingestion completed for {len(vm_contexts)} VM folder(s)")
-
-    return vm_contexts
-
-
-def flatten_folder_contexts(vm_contexts: Iterable[VMContext]) -> List[FolderContext]:
-    folders: List[FolderContext] = []
-
-    for vm_context in vm_contexts:
-        folders.extend(vm_context.folders)
-
-    return folders
-
-
-def summarize_vm_context(vm_context: VMContext) -> Dict[str, int | str]:
-    return {
-        "vm_name": vm_context.vm_name,
-        "folder_count": vm_context.folder_count,
-        "included_file_count": vm_context.included_file_count,
-        "ignored_file_count": vm_context.ignored_file_count,
-        "truncated_file_count": vm_context.truncated_file_count,
-    }
-
-
-def summarize_ingestion(vm_contexts: Iterable[VMContext]) -> List[Dict[str, int | str]]:
-    return [summarize_vm_context(vm_context) for vm_context in vm_contexts]
+Required tables:
+
+| Original Parameter | Recommendation | Reasoning & Justification | Citations |
+|---|---|---|---|
+
+| Original Parameters | Recommendation | Reasoning & Justification | Citations |
+|---|---|---|---|
+
+| Rule / Check | Parameter Found | Observed Value | Expected Value | Status | Reasoning | Citations |
+|---|---|---|---|---|---|---|
+
+Allowed checklist statuses:
+- Compliant
+- Recommendation Issued
+- Not Applicable
+- Not Checked
+""".strip()
