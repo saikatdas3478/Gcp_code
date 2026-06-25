@@ -1,142 +1,244 @@
 from __future__ import annotations
 
-import json
-import os
-from typing import Any, AsyncGenerator
-
-import uvicorn
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
-
-from .orchestrator import run_health_check_stream
-from .schemas import HealthCheckRequest
+import re
+from dataclasses import dataclass
+from pathlib import PurePosixPath
+from typing import Optional, Tuple
 
 
-app = FastAPI(
-    title="SAP HANA Health Check Service",
-    version="1.0.0",
-)
+GENERAL_ALLOWED_EXTENSIONS = {
+    ".log",
+    ".txt",
+    ".ini",
+    ".conf",
+    ".master",
+    ".smb",
+    ".misc",
+    ".net",
+}
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+GLOBAL_IGNORED_EXTENSIONS = {
+    ".err",
+    ".lst",
+}
+
+PROFILE_REQUIRED_EXACT_FILES = {
+    "default.pfl",
+}
+
+PROFILE_IGNORED_EXACT_FILES = {
+    "trans.log",
+}
 
 
-def _json_default(value: Any) -> str:
-    if hasattr(value, "isoformat"):
-        return value.isoformat()
-    return str(value)
+@dataclass(frozen=True)
+class FileFilterDecision:
+    include: bool
+    reason: str
+    rule_group: str
 
 
-def _format_sse(event_name: str, data: Any) -> str:
-    payload = json.dumps(data, default=_json_default, ensure_ascii=False)
-    return f"event: {event_name}\ndata: {payload}\n\n"
+def normalize_filename(filename: str) -> str:
+    return str(filename or "").strip().lower()
 
 
-def _normalize_event(raw_event: Any) -> tuple[str, Any]:
-    if isinstance(raw_event, dict):
-        event_name = (
-            raw_event.get("event")
-            or raw_event.get("event_name")
-            or raw_event.get("type")
-            or "pipeline_update"
+def normalize_folder_path(folder_relative_path: Optional[str]) -> str:
+    if not folder_relative_path:
+        return "."
+
+    normalized = str(PurePosixPath(str(folder_relative_path).strip("/"))).lower()
+    return normalized if normalized else "."
+
+
+def get_file_extension(filename: str) -> str:
+    return PurePosixPath(normalize_filename(filename)).suffix
+
+
+def is_profile_folder(folder_relative_path: Optional[str]) -> bool:
+    normalized_path = normalize_folder_path(folder_relative_path)
+    path_parts = PurePosixPath(normalized_path).parts
+    return any(part == "profile" for part in path_parts)
+
+
+def ends_with_number_suffix(filename: str) -> bool:
+    return bool(re.search(r"\.\d+$", normalize_filename(filename)))
+
+
+def has_backup_or_lst_suffix(filename: str) -> bool:
+    lowered = normalize_filename(filename)
+
+    return (
+        lowered.endswith("_bak")
+        or lowered.endswith(".bak")
+        or lowered.endswith("_lst")
+        or lowered.endswith(".lst")
+    )
+
+
+def is_global_ignored_file(filename: str) -> Tuple[bool, str]:
+    lowered = normalize_filename(filename)
+    extension = get_file_extension(lowered)
+
+    if extension == ".err":
+        return True, "Ignored because .err files are excluded globally."
+
+    if extension == ".lst":
+        return True, "Ignored because .lst files are excluded globally."
+
+    if lowered.endswith("_bak") or lowered.endswith(".bak"):
+        return True, "Ignored because backup files are excluded globally."
+
+    if lowered.endswith("_lst") or lowered.endswith(".lst"):
+        return True, "Ignored because list suffix files are excluded globally."
+
+    return False, ""
+
+
+def should_include_general_file(filename: str) -> FileFilterDecision:
+    lowered = normalize_filename(filename)
+    extension = get_file_extension(lowered)
+
+    ignored, reason = is_global_ignored_file(lowered)
+    if ignored:
+        return FileFilterDecision(
+            include=False,
+            reason=reason,
+            rule_group="general",
         )
-        data = raw_event.get("data", raw_event)
-        return str(event_name), data
 
-    event_name = (
-        getattr(raw_event, "event_name", None)
-        or getattr(raw_event, "event", None)
-        or getattr(raw_event, "type", None)
-        or "pipeline_update"
-    )
+    if extension in GENERAL_ALLOWED_EXTENSIONS:
+        return FileFilterDecision(
+            include=True,
+            reason=f"Included because extension {extension} is allowed.",
+            rule_group="general",
+        )
 
-    if hasattr(raw_event, "model_dump"):
-        data = raw_event.model_dump()
-    elif hasattr(raw_event, "__dict__"):
-        data = vars(raw_event)
-    else:
-        data = {"message": str(raw_event)}
-
-    return str(event_name), data
-
-
-@app.get("/")
-async def root() -> dict[str, str]:
-    return {
-        "service": "SAP HANA Health Check Service",
-        "status": "running",
-    }
-
-
-@app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "healthy"}
-
-
-@app.post("/sap-health-check/stream")
-async def sap_health_check_stream(
-    payload: HealthCheckRequest,
-    request: Request,
-) -> StreamingResponse:
-    async def event_generator() -> AsyncGenerator[str, None]:
-        try:
-            yield _format_sse(
-                "request_received",
-                {
-                    "message": "SAP Health Check request received.",
-                    "gcs_bucket_path": payload.gcs_bucket_path,
-                    "max_parallel_vms": payload.max_parallel_vms or 3,
-                },
-            )
-
-            async for raw_event in run_health_check_stream(payload):
-                if await request.is_disconnected():
-                    break
-
-                event_name, data = _normalize_event(raw_event)
-                yield _format_sse(event_name, data)
-
-        except Exception as exc:
-            yield _format_sse(
-                "pipeline_failed",
-                {
-                    "status": "failed",
-                    "message": str(exc),
-                },
-            )
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+    return FileFilterDecision(
+        include=False,
+        reason=(
+            f"Ignored because extension {extension or '[no extension]'} "
+            "is not in the allowed general extension list."
+        ),
+        rule_group="general",
     )
 
 
-@app.exception_handler(Exception)
-async def global_exception_handler(_: Request, exc: Exception) -> JSONResponse:
-    return JSONResponse(
-        status_code=500,
-        content={
-            "status": "failed",
-            "message": str(exc),
-        },
+def should_include_profile_file(filename: str) -> FileFilterDecision:
+    lowered = normalize_filename(filename)
+    extension = get_file_extension(lowered)
+
+    ignored, reason = is_global_ignored_file(lowered)
+    if ignored:
+        return FileFilterDecision(
+            include=False,
+            reason=reason,
+            rule_group="profile",
+        )
+
+    if lowered in PROFILE_IGNORED_EXACT_FILES:
+        return FileFilterDecision(
+            include=False,
+            reason="Ignored because trans.log is excluded inside profile folder.",
+            rule_group="profile",
+        )
+
+    if extension == ".log":
+        return FileFilterDecision(
+            include=False,
+            reason="Ignored because .log files are excluded inside profile folder.",
+            rule_group="profile",
+        )
+
+    if ends_with_number_suffix(lowered):
+        return FileFilterDecision(
+            include=False,
+            reason="Ignored because numeric suffix files like .1, .2, .3 are excluded inside profile folder.",
+            rule_group="profile",
+        )
+
+    if has_backup_or_lst_suffix(lowered):
+        return FileFilterDecision(
+            include=False,
+            reason="Ignored because backup/list suffix files are excluded inside profile folder.",
+            rule_group="profile",
+        )
+
+    if lowered in PROFILE_REQUIRED_EXACT_FILES:
+        return FileFilterDecision(
+            include=True,
+            reason="Included because default.pfl is explicitly required inside profile folder.",
+            rule_group="profile",
+        )
+
+    return FileFilterDecision(
+        include=True,
+        reason="Included because file is inside profile folder and does not match any profile exclusion rule.",
+        rule_group="profile",
     )
 
 
-if __name__ == "__main__":
-    uvicorn.run(
-        "sap_hc_agent.main:app",
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", "8080")),
-        reload=os.getenv("ENV", "").lower() == "local",
+def should_include_file_detailed(
+    filename: str,
+    folder_relative_path: Optional[str],
+) -> FileFilterDecision:
+    if not filename or not str(filename).strip():
+        return FileFilterDecision(
+            include=False,
+            reason="Ignored because filename is empty.",
+            rule_group="general",
+        )
+
+    if is_profile_folder(folder_relative_path):
+        return should_include_profile_file(filename)
+
+    return should_include_general_file(filename)
+
+
+def should_include_file(
+    filename: str,
+    folder_relative_path: Optional[str],
+) -> Tuple[bool, str]:
+    decision = should_include_file_detailed(
+        filename=filename,
+        folder_relative_path=folder_relative_path,
+    )
+    return decision.include, decision.reason
+
+
+def should_ignore_file(
+    filename: str,
+    folder_relative_path: Optional[str],
+) -> Tuple[bool, str]:
+    decision = should_include_file_detailed(
+        filename=filename,
+        folder_relative_path=folder_relative_path,
+    )
+    return not decision.include, decision.reason
+
+
+def is_allowed_general_extension(filename: str) -> bool:
+    return get_file_extension(filename) in GENERAL_ALLOWED_EXTENSIONS
+
+
+def is_globally_ignored_extension(filename: str) -> bool:
+    return get_file_extension(filename) in GLOBAL_IGNORED_EXTENSIONS
+
+
+def explain_file_filter_decision(
+    filename: str,
+    folder_relative_path: Optional[str],
+) -> str:
+    decision = should_include_file_detailed(
+        filename=filename,
+        folder_relative_path=folder_relative_path,
+    )
+
+    action = "INCLUDED" if decision.include else "IGNORED"
+    folder = normalize_folder_path(folder_relative_path)
+
+    return (
+        f"{action}: {filename} | "
+        f"folder={folder} | "
+        f"rule_group={decision.rule_group} | "
+        f"reason={decision.reason}"
     )
