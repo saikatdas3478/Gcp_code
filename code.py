@@ -1,236 +1,339 @@
 from __future__ import annotations
 
-
-def return_description() -> str:
-    return """
-You are a highly specialized SAP HANA Health Check Assistant.
-
-The user provides a GCS root folder path and dynamic corpus IDs.
-The service processes VM folders and log/configuration files from GCS, performs retrieval from SAP Rule Book, SAP Notes, previous assessment reports, and related Google documentation, then generates SAP HANA health check recommendations.
-
-The final recommendation style must remain exactly like the previously approved SAP Health Check report style:
-- Individual Parameter Recommendations table
-- Combined Pattern Recommendations table
-- Compliance & Checklist Report table
-
-Do not ask the user to manually upload files.
-Do not change the approved report style.
-Do not invent facts, values, citations, SAP Note numbers, GCP rule IDs, or file names.
-"""
-
-
-def return_folder_recommendation_prompt(
-    folder_context_json: str,
-    retrieval_context_json: str,
-) -> str:
-    return f"""
-You are a highly specialized SAP HANA Health Check Assistant and provide recommendations based on the provided VM folder logs/configuration data.
-
-Your purpose is to deliver expert, in-depth health check recommendations for SAP HANA systems.
-You achieve this by analyzing folder-level VM data, identifying individual parameter issues and combined parameter patterns, and generating actionable, evidence-based advice to optimize performance, security, stability, and compliance.
-
-You must keep the recommendation output style exactly like the previously approved SAP Health Check report style.
-
-Strict rules:
-- Return Markdown only.
-- Do not return JSON.
-- Do not return code blocks.
-- Do not invent parameter values, file names, line numbers, SAP Note numbers, GCP rule IDs, URLs, or citations.
-- Use current observed values only from the provided VM folder logs/config files.
-- Use SAP Rule Book RAG and SAP Notes RAG as recommendation evidence.
-- Use Google documentation context only when it is provided and relevant.
-- Use previous assessment reports only as style and recommendation-pattern guidance.
-- Never use previous assessment report values as current observed values.
-- If previous reports contain old values, ignore those values.
-- If evidence is insufficient, mention "Not Checked" or "Not Applicable" instead of guessing.
-- Every recommendation must include observed value/fact/number wherever available.
-- Reasoning must be short, crisp, and evidence-backed.
-- Keep citations concise.
-- If there are no findings for a section, write "No recommendation issued based on the available evidence."
-
-Folder context JSON:
-{folder_context_json}
-
-Retrieval context JSON:
-{retrieval_context_json}
-
-Generate the folder-level recommendation in exactly this Markdown format:
-
-Hello, I have completed the comprehensive analysis of the provided VM folder data.
-
-VM Name:
-Folder Name:
-
-Individual Parameter Recommendations in below table format:
-
-| Original Parameter | Recommendation | Reasoning & Justification | Citations |
-|---|---|---|---|
-| parameter_name = observed_value | crisp recommendation | 2-4 line evidence-backed reason explaining why this recommendation is needed | input file / SAP Note / GCP Rule Book / Google documentation reference |
-
-Combined Pattern Recommendations in below table format:
-
-| Original Parameters | Recommendation | Reasoning & Justification | Citations |
-|---|---|---|---|
-| parameter_1 = observed_value, parameter_2 = observed_value | crisp combined recommendation | 2-4 line explanation of the relationship between the observed parameters and why the recommendation is needed | input file / SAP Note / GCP Rule Book / Google documentation reference |
-
-Compliance & Checklist Report in below table format:
-
-| Rule / Check | Parameter Found | Observed Value | Expected Value | Status | Reasoning | Citations |
-|---|---|---|---|---|---|---|
-| rule or check name | Yes/No | observed value or N/A | expected value or N/A | Compliant / Recommendation Issued / Not Applicable / Not Checked | short reason | input file / SAP Note / GCP Rule Book / Google documentation reference |
-
-I hope these recommendations are helpful. Please let me know if you have any questions or require further clarification on any of these points.
-""".strip()
-
-
-def return_folder_analysis_prompt(folder_input_json: str) -> str:
-    return f"""
-You are a highly specialized SAP HANA Health Check Assistant and provide recommendations based on the provided VM folder logs/configuration data.
-
-Your purpose is to deliver expert, in-depth health check recommendations for SAP HANA systems.
-You achieve this by analyzing folder-level VM data, identifying individual parameter issues and combined parameter patterns, and generating actionable, evidence-based advice to optimize performance, security, stability, and compliance.
-
-You must keep the recommendation output style exactly like the previously approved SAP Health Check report style.
-
-Strict rules:
-- Return Markdown only.
-- Do not return JSON.
-- Do not return code blocks.
-- Do not invent parameter values, file names, line numbers, SAP Note numbers, GCP rule IDs, URLs, or citations.
-- Use current observed values only from the provided VM folder logs/config files.
-- Use SAP Rule Book RAG and SAP Notes RAG as recommendation evidence.
-- Use Google documentation context only when it is provided and relevant.
-- Use previous assessment reports only as style and recommendation-pattern guidance.
-- Never use previous assessment report values as current observed values.
-- If evidence is insufficient, mention "Not Checked" or "Not Applicable" instead of guessing.
-- Every recommendation must include observed value/fact/number wherever available.
-- Reasoning must be short, crisp, and evidence-backed.
-- Keep citations concise.
-- If there are no findings for a section, write "No recommendation issued based on the available evidence."
-
-Folder input JSON:
-{folder_input_json}
-
-Generate the folder-level recommendation in exactly this Markdown format:
-
-Hello, I have completed the comprehensive analysis of the provided VM folder data.
-
-VM Name:
-Folder Name:
-
-Individual Parameter Recommendations in below table format:
-
-| Original Parameter | Recommendation | Reasoning & Justification | Citations |
-|---|---|---|---|
-| parameter_name = observed_value | crisp recommendation | 2-4 line evidence-backed reason explaining why this recommendation is needed | input file / SAP Note / GCP Rule Book / Google documentation reference |
-
-Combined Pattern Recommendations in below table format:
-
-| Original Parameters | Recommendation | Reasoning & Justification | Citations |
-|---|---|---|---|
-| parameter_1 = observed_value, parameter_2 = observed_value | crisp combined recommendation | 2-4 line explanation of the relationship between the observed parameters and why the recommendation is needed | input file / SAP Note / GCP Rule Book / Google documentation reference |
-
-Compliance & Checklist Report in below table format:
-
-| Rule / Check | Parameter Found | Observed Value | Expected Value | Status | Reasoning | Citations |
-|---|---|---|---|---|---|---|
-| rule or check name | Yes/No | observed value or N/A | expected value or N/A | Compliant / Recommendation Issued / Not Applicable / Not Checked | short reason | input file / SAP Note / GCP Rule Book / Google documentation reference |
-
-I hope these recommendations are helpful. Please let me know if you have any questions or require further clarification on any of these points.
-""".strip()
-
-
-def return_vm_consolidation_prompt(vm_input_json: str) -> str:
-    return f"""
-You are a highly specialized SAP HANA Health Check consolidation analyst.
-
-You will receive all folder-level SAP Health Check recommendation outputs for one VM.
-
-Your task:
-1. Merge duplicate or overlapping recommendations.
-2. Keep the strongest and most evidence-backed recommendation.
-3. Preserve current observed values, numbers, parameters, file references, SAP Notes, GCP rule references, and Google documentation references wherever available.
-4. Keep the final VM-level output style exactly like the previously approved SAP Health Check report style.
-5. Do not return JSON.
-6. Do not return code blocks.
-7. Do not invent facts, values, SAP Notes, GCP rules, URLs, file names, or citations.
-8. Use previous assessment report references only as style guidance, never as current VM evidence.
-9. If evidence is weak or unavailable, mark the checklist item as "Not Checked" or "Not Applicable".
-
-VM consolidation input JSON:
-{vm_input_json}
-
-Generate the consolidated VM-level recommendation in exactly this Markdown format:
-
-Hello, I have completed the comprehensive analysis of your VM parameter data.
-Here are my findings, separated into individual and combined recommendations.
-
-VM Name:
-
-Individual Parameter Recommendations in below table format:
-
-| Original Parameter | Recommendation | Reasoning & Justification | Citations |
-|---|---|---|---|
-| parameter_name = observed_value | crisp recommendation | 2-4 line evidence-backed reason explaining why this recommendation is needed | input file / SAP Note / GCP Rule Book / Google documentation reference |
-
-Combined Pattern Recommendations in below table format:
-
-| Original Parameters | Recommendation | Reasoning & Justification | Citations |
-|---|---|---|---|
-| parameter_1 = observed_value, parameter_2 = observed_value | crisp combined recommendation | 2-4 line explanation of the relationship between the observed parameters and why the recommendation is needed | input file / SAP Note / GCP Rule Book / Google documentation reference |
-
-Compliance & Checklist Report in below table format:
-
-| Rule / Check | Parameter Found | Observed Value | Expected Value | Status | Reasoning | Citations |
-|---|---|---|---|---|---|---|
-| rule or check name | Yes/No | observed value or N/A | expected value or N/A | Compliant / Recommendation Issued / Not Applicable / Not Checked | short reason | input file / SAP Note / GCP Rule Book / Google documentation reference |
-
-I hope these recommendations are helpful. Please let me know if you have any questions or require further clarification on any of these points.
-""".strip()
-
-
-def return_final_report_header_prompt() -> str:
-    return """
-# SAP HANA Health Check Recommendation Report
-
-This report contains VM-wise SAP HANA health check recommendations generated from the provided GCS input path.
-
-The recommendation format follows the previously approved SAP Health Check report style.
-""".strip()
-
-
-def return_previous_report_usage_rule() -> str:
-    return """
-Previous assessment reports are outdated examples.
-Use them only to understand recommendation style, phrasing, report structure, and common recommendation patterns.
-Never use previous report values as current observed values.
-Current observed values must come only from the uploaded VM logs/configuration files.
-""".strip()
-
-
-def return_markdown_contract() -> str:
-    return """
-The output must be Markdown only.
-
-Required sections:
-1. Individual Parameter Recommendations
-2. Combined Pattern Recommendations
-3. Compliance & Checklist Report
-
-Required tables:
-
-| Original Parameter | Recommendation | Reasoning & Justification | Citations |
-|---|---|---|---|
-
-| Original Parameters | Recommendation | Reasoning & Justification | Citations |
-|---|---|---|---|
-
-| Rule / Check | Parameter Found | Observed Value | Expected Value | Status | Reasoning | Citations |
-|---|---|---|---|---|---|---|
-
-Allowed checklist statuses:
-- Compliant
-- Recommendation Issued
-- Not Applicable
-- Not Checked
-""".strip()
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Any, Dict, List, Optional
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+class StrictBaseModel(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        validate_assignment=True,
+        populate_by_name=True,
+    )
+
+
+class PipelineStatus(str, Enum):
+    STARTED = "started"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+class StreamEventName(str, Enum):
+    REQUEST_RECEIVED = "request_received"
+    PATH_VALIDATED = "path_validated"
+    VM_DISCOVERY_STARTED = "vm_discovery_started"
+    VM_DISCOVERY_COMPLETED = "vm_discovery_completed"
+    VM_PROCESSING_STARTED = "vm_processing_started"
+    VM_PROCESSING_COMPLETED = "vm_processing_completed"
+    FILE_SCAN_STARTED = "file_scan_started"
+    FILE_SCAN_COMPLETED = "file_scan_completed"
+    FOLDER_CONTEXT_STARTED = "folder_context_started"
+    FOLDER_CONTEXT_BUILT = "folder_context_built"
+    RULEBOOK_LINK_MATCH_STARTED = "rulebook_link_match_started"
+    RULEBOOK_LINK_MATCH_COMPLETED = "rulebook_link_match_completed"
+    GOOGLE_DOC_FETCH_STARTED = "google_doc_fetch_started"
+    GOOGLE_DOC_FETCH_COMPLETED = "google_doc_fetch_completed"
+    RAG_QUERY_STARTED = "rag_query_started"
+    RAG_QUERY_COMPLETED = "rag_query_completed"
+    FOLDER_LLM_STARTED = "folder_llm_started"
+    FOLDER_LLM_COMPLETED = "folder_llm_completed"
+    VM_CONSOLIDATION_STARTED = "vm_consolidation_started"
+    VM_CONSOLIDATION_COMPLETED = "vm_consolidation_completed"
+    REPORT_WRITE_STARTED = "report_write_started"
+    REPORT_WRITE_COMPLETED = "report_write_completed"
+    PIPELINE_COMPLETED = "pipeline_completed"
+    PIPELINE_FAILED = "pipeline_failed"
+
+
+class SourceType(str, Enum):
+    INPUT_FILE = "input_file"
+    SAP_RULE_BOOK_RAG = "sap_rule_book_rag"
+    SAP_NOTES_RAG = "sap_notes_rag"
+    PREVIOUS_REPORTS_RAG = "previous_reports_rag"
+    GOOGLE_DOC = "google_doc"
+    RULEBOOK_LINK = "rulebook_link"
+    FOLDER_VECTOR = "folder_vector"
+    OTHER = "other"
+
+
+class HealthCheckRequest(StrictBaseModel):
+    gcs_bucket_path: str = Field(..., min_length=1)
+    sap_rule_book_corpus_id: str = Field(..., min_length=1)
+    sap_notes_corpus_id: str = Field(..., min_length=1)
+    previous_reports_corpus_id: str = Field(..., min_length=1)
+    max_parallel_vms: Optional[int] = Field(default=3, ge=1, le=10)
+
+    @field_validator("gcs_bucket_path")
+    @classmethod
+    def validate_gcs_bucket_path(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned.startswith("gs://"):
+            raise ValueError("gcs_bucket_path must start with gs://")
+        if cleaned == "gs://":
+            raise ValueError("gcs_bucket_path must include bucket name and root prefix")
+        return cleaned.rstrip("/") + "/"
+
+    @field_validator(
+        "sap_rule_book_corpus_id",
+        "sap_notes_corpus_id",
+        "previous_reports_corpus_id",
+    )
+    @classmethod
+    def validate_corpus_id(cls, value: str) -> str:
+        cleaned = str(value).strip()
+        if not cleaned:
+            raise ValueError("corpus id cannot be empty")
+        return cleaned
+
+    @field_validator("max_parallel_vms")
+    @classmethod
+    def validate_max_parallel_vms(cls, value: Optional[int]) -> int:
+        if value is None:
+            return 3
+        return value
+
+
+class StreamEvent(StrictBaseModel):
+    event: StreamEventName
+    status: PipelineStatus = PipelineStatus.RUNNING
+    message: str = Field(..., min_length=1)
+    vm_name: Optional[str] = None
+    folder_name: Optional[str] = None
+    current: Optional[int] = None
+    total: Optional[int] = None
+    data: Dict[str, Any] = Field(default_factory=dict)
+    timestamp_utc: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    def to_sse_dict(self) -> Dict[str, Any]:
+        return {
+            "event": self.event.value,
+            "data": self.model_dump(mode="json"),
+        }
+
+
+class GCSPath(StrictBaseModel):
+    bucket_name: str = Field(..., min_length=1)
+    prefix: str = ""
+
+    @property
+    def uri(self) -> str:
+        if self.prefix:
+            return f"gs://{self.bucket_name}/{self.prefix.strip('/')}/"
+        return f"gs://{self.bucket_name}/"
+
+
+class IgnoredFile(StrictBaseModel):
+    gcs_uri: str = Field(..., min_length=1)
+    relative_path: Optional[str] = None
+    reason: str = Field(..., min_length=1)
+
+
+class SourceFile(StrictBaseModel):
+    gcs_uri: str = Field(..., min_length=1)
+    relative_path: str = Field(..., min_length=1)
+    folder_relative_path: str = Field(..., min_length=1)
+    filename: str = Field(..., min_length=1)
+    lines_read: int = Field(..., ge=0)
+    truncated: bool = False
+    content: Optional[str] = None
+
+    @field_validator("gcs_uri")
+    @classmethod
+    def validate_gcs_uri(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned.startswith("gs://"):
+            raise ValueError("gcs_uri must start with gs://")
+        return cleaned
+
+
+class TextChunk(StrictBaseModel):
+    chunk_id: str = Field(..., min_length=1)
+    vm_name: str = Field(..., min_length=1)
+    folder_name: str = Field(..., min_length=1)
+    source_uri: Optional[str] = None
+    relative_path: Optional[str] = None
+    line_range: Optional[str] = None
+    text: str = Field(..., min_length=1)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class FolderContext(StrictBaseModel):
+    vm_name: str = Field(..., min_length=1)
+    folder_name: str = Field(..., min_length=1)
+    folder_gcs_prefix: str = Field(..., min_length=1)
+    included_files: List[SourceFile] = Field(default_factory=list)
+    ignored_files: List[IgnoredFile] = Field(default_factory=list)
+    chunks: List[TextChunk] = Field(default_factory=list)
+    combined_text: str = ""
+    truncated_file_count: int = 0
+
+    @property
+    def included_file_count(self) -> int:
+        return len(self.included_files)
+
+    @property
+    def ignored_file_count(self) -> int:
+        return len(self.ignored_files)
+
+
+class VMContext(StrictBaseModel):
+    vm_name: str = Field(..., min_length=1)
+    vm_gcs_prefix: str = Field(..., min_length=1)
+    folders: List[FolderContext] = Field(default_factory=list)
+    ignored_files: List[IgnoredFile] = Field(default_factory=list)
+
+    @property
+    def folder_count(self) -> int:
+        return len(self.folders)
+
+    @property
+    def included_file_count(self) -> int:
+        return sum(folder.included_file_count for folder in self.folders)
+
+    @property
+    def ignored_file_count(self) -> int:
+        return len(self.ignored_files) + sum(folder.ignored_file_count for folder in self.folders)
+
+    @property
+    def truncated_file_count(self) -> int:
+        return sum(folder.truncated_file_count for folder in self.folders)
+
+
+class RulebookLinkMatch(StrictBaseModel):
+    section_key: str = Field(..., min_length=1)
+    matched_score: float = Field(default=0.0, ge=0.0)
+    matched_terms: List[str] = Field(default_factory=list)
+    urls: List[str] = Field(default_factory=list)
+
+
+class GoogleDocContext(StrictBaseModel):
+    section_key: str = Field(..., min_length=1)
+    url: str = Field(..., min_length=1)
+    title: Optional[str] = None
+    text: Optional[str] = None
+    status: PipelineStatus = PipelineStatus.COMPLETED
+    error_message: Optional[str] = None
+
+
+class RetrievalHit(StrictBaseModel):
+    source_type: SourceType
+    corpus_id: Optional[str] = None
+    query: str = Field(..., min_length=1)
+    text: str = Field(..., min_length=1)
+    source_uri: Optional[str] = None
+    source_title: Optional[str] = None
+    relevance_score: Optional[float] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class RetrievalContext(StrictBaseModel):
+    rulebook_link_matches: List[RulebookLinkMatch] = Field(default_factory=list)
+    google_doc_contexts: List[GoogleDocContext] = Field(default_factory=list)
+    sap_rule_book_hits: List[RetrievalHit] = Field(default_factory=list)
+    sap_notes_hits: List[RetrievalHit] = Field(default_factory=list)
+    previous_report_style_hits: List[RetrievalHit] = Field(default_factory=list)
+    folder_vector_hits: List[RetrievalHit] = Field(default_factory=list)
+    queries_used: List[str] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+
+
+class FolderRecommendation(StrictBaseModel):
+    vm_name: str = Field(..., min_length=1)
+    folder_name: str = Field(..., min_length=1)
+    markdown: str = Field(..., min_length=1)
+    included_files: List[SourceFile] = Field(default_factory=list)
+    ignored_files: List[IgnoredFile] = Field(default_factory=list)
+    retrieval_context: Optional[RetrievalContext] = None
+    warnings: List[str] = Field(default_factory=list)
+
+
+class VMRecommendation(StrictBaseModel):
+    vm_name: str = Field(..., min_length=1)
+    vm_gcs_prefix: str = Field(..., min_length=1)
+    markdown: str = Field(..., min_length=1)
+    folder_recommendations: List[FolderRecommendation] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+
+
+class ReportResult(StrictBaseModel):
+    output_gcs_uri: str = Field(..., min_length=1)
+    markdown: Optional[str] = None
+
+    @field_validator("output_gcs_uri")
+    @classmethod
+    def validate_output_gcs_uri(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned.startswith("gs://"):
+            raise ValueError("output_gcs_uri must start with gs://")
+        if cleaned.endswith("/"):
+            raise ValueError("output_gcs_uri must point to a file")
+        return cleaned
+
+
+class PipelineSummary(StrictBaseModel):
+    gcs_bucket_path: str = Field(..., min_length=1)
+    output_gcs_uri: Optional[str] = None
+    status: PipelineStatus = PipelineStatus.COMPLETED
+    total_vm_folders_found: int = Field(default=0, ge=0)
+    total_vm_folders_processed: int = Field(default=0, ge=0)
+    total_folders_processed: int = Field(default=0, ge=0)
+    total_files_included: int = Field(default=0, ge=0)
+    total_files_ignored: int = Field(default=0, ge=0)
+    total_files_truncated: int = Field(default=0, ge=0)
+    started_at_utc: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    completed_at_utc: Optional[datetime] = None
+    errors: List[str] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+
+
+class PipelineResult(StrictBaseModel):
+    summary: PipelineSummary
+    vm_recommendations: List[VMRecommendation] = Field(default_factory=list)
+    report_result: Optional[ReportResult] = None
+
+
+class FolderProcessingInput(StrictBaseModel):
+    request: HealthCheckRequest
+    folder_context: FolderContext
+    retrieval_context: RetrievalContext
+
+
+class VMProcessingInput(StrictBaseModel):
+    request: HealthCheckRequest
+    vm_context: VMContext
+
+
+class FolderProcessingOutput(StrictBaseModel):
+    folder_context: FolderContext
+    retrieval_context: RetrievalContext
+    recommendation: FolderRecommendation
+
+
+class VMProcessingOutput(StrictBaseModel):
+    vm_context: VMContext
+    recommendation: VMRecommendation
+
+
+class LLMGenerationConfig(StrictBaseModel):
+    model_name: str
+    temperature: float = Field(default=0.2, ge=0.0, le=2.0)
+    max_output_tokens: Optional[int] = Field(default=None, ge=1)
+
+
+class RuntimeConfig(StrictBaseModel):
+    project_id: str = Field(..., min_length=1)
+    location: str = Field(default="us-central1", min_length=1)
+    max_lines_per_file: int = Field(default=1000, ge=1)
+    max_parallel_vms: int = Field(default=3, ge=1, le=10)
+    llm: LLMGenerationConfig
+
+    @model_validator(mode="after")
+    def validate_runtime(self) -> "RuntimeConfig":
+        if self.max_parallel_vms < 1:
+            self.max_parallel_vms = 3
+        return self
