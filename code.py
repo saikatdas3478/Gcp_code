@@ -132,3 +132,31 @@ from .recommendation_service import (
     create_recommendation_service,
     build_deterministic_vm_markdown,
 )
+
+def generate_vm_consolidation(
+    request: HealthCheckRequest,
+    vm_name: str,
+    vm_gcs_prefix: str,
+    folder_recommendations: List[FolderRecommendation],
+    client: Optional[genai.Client] = None,
+    runtime_config: Optional[RuntimeConfig] = None,
+) -> VMRecommendation:
+    warnings: List[str] = []
+
+    for folder_recommendation in folder_recommendations:
+        warnings.extend(folder_recommendation.warnings)
+
+    markdown = build_deterministic_vm_markdown(
+        vm_name=vm_name,
+        vm_gcs_prefix=vm_gcs_prefix,
+        folder_recommendations=folder_recommendations,
+        folder_errors=warnings,
+    )
+
+    return VMRecommendation(
+        vm_name=vm_name,
+        vm_gcs_prefix=vm_gcs_prefix,
+        markdown=markdown,
+        folder_recommendations=folder_recommendations,
+        warnings=warnings,
+    )
