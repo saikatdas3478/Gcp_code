@@ -156,3 +156,48 @@ def query_rag_corpus(
 pythonpath = ["."]
 testpaths = ["tests"]
 addopts = "-vv -s"
+
+emit_event(
+    callback=progress_callback,
+    event="vm_consolidation_started",
+    message=f"{vm_name}: deterministic VM-level markdown assembly started.",
+    vm_name=vm_name,
+    data={
+        "folder_recommendation_count": len(folder_recommendations),
+        "folder_error_count": len(folder_errors),
+    },
+)
+
+vm_recommendation = recommendation_service.consolidate_vm(
+    request=request,
+    vm_name=vm_name,
+    vm_gcs_prefix=vm_prefix,
+    folder_recommendations=folder_recommendations,
+)
+
+vm_recommendation.warnings.extend(folder_errors)
+
+if folder_errors:
+    vm_recommendation.markdown = build_deterministic_vm_markdown(
+        vm_name=vm_name,
+        vm_gcs_prefix=vm_prefix,
+        folder_recommendations=folder_recommendations,
+        folder_errors=folder_errors,
+    )
+
+emit_event(
+    callback=progress_callback,
+    event="vm_consolidation_completed",
+    message=f"{vm_name}: deterministic VM-level markdown assembly completed.",
+    vm_name=vm_name,
+    data={
+        "folder_recommendation_count": len(folder_recommendations),
+        "warning_count": len(vm_recommendation.warnings),
+        "markdown_char_count": len(vm_recommendation.markdown),
+    },
+)
+
+from .recommendation_service import (
+    create_recommendation_service,
+    build_deterministic_vm_markdown,
+)
